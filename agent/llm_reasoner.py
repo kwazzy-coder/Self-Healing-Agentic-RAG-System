@@ -6,7 +6,14 @@ This is the single biggest improvement for multi-hop QA.
 
 Expected improvement: +15-20% EM, +10-15% F1
 """
-import os, time, threading, re
+import os
+import time
+import threading
+import re
+import logging
+from typing import List, Optional, Any
+
+import config
 from config import (
     LLM_BACKEND,
     GEMINI_API_KEY, GEMINI_MODEL,
@@ -16,8 +23,8 @@ from config import (
     MIN_DELAY_BETWEEN_CALLS, MAX_RETRIES, RETRY_WAIT_SECONDS,
 )
 
-# Chain-of-Thought few-shot examples
-# Show the model HOW to reason before answering
+logger = logging.getLogger(__name__)
+
 COT_FEW_SHOT = """Examples of correct reasoning:
 
 Q: What nationality is the director of the film Titanic?
@@ -39,12 +46,14 @@ Answer: Time
 
 
 class _RateLimiter:
-    def __init__(self, min_delay):
+    """Thread-safe rate limiter for API calls."""
+    def __init__(self, min_delay: float) -> None:
         self._lock = threading.Lock()
         self._last = 0.0
         self.min_delay = min_delay
 
-    def wait(self):
+    def wait(self) -> None:
+        """Wait if necessary to enforce the minimum delay."""
         with self._lock:
             gap = self.min_delay - (time.time() - self._last)
             if gap > 0 and self._last > 0:
@@ -56,136 +65,188 @@ _limiter = _RateLimiter(MIN_DELAY_BETWEEN_CALLS)
 
 
 class LLMReasoner:
-    def __init__(self, backend=None):
-        self.backend        = backend or LLM_BACKEND
+    """LLM Reasoner with Chain-of-Thought capabilities."""
+    
+    def __init__(self, backend: Optional[str] = None) -> None:
+        """
+        Initialize the LLM Reasoner.
+        
+        Args:
+            backend: Optional backend override.
+        """
+        self.backend = backend or LLM_BACKEND
         self._gemini_client = None
-        self._groq_client   = None
-        self._oai_client    = None
-        self._hf_tokenizer  = None
-        self._hf_model      = None
+        self._groq_client = None
+        self._oai_client = None
+        self._hf_tokenizer = None
+        self._hf_model = None
         self._init()
 
-    def _init(self):
+    def _init(self) -> None:
+        """Initialize the requested backend, falling back iteratively if needed."""
+        backends_to_try = [self.backend]
         if self.backend == "gemini":
-            if self._init_gemini(): print(f"[LLMReasoner] ✓ Gemini: {GEMINI_MODEL}")
-            else: self.backend = "groq"; self._init()
+            backends_to_try.extend(["groq", "ollama", "openai", "huggingface"])
         elif self.backend == "groq":
-            if self._init_groq(): print(f"[LLMReasoner] ✓ Groq: {GROQ_MODEL}")
-            else: self.backend = "ollama"; self._init()
+            backends_to_try.extend(["ollama", "openai", "huggingface"])
         elif self.backend == "ollama":
-            if self._check_ollama(): print(f"[LLMReasoner] ✓ Ollama: {OLLAMA_MODEL}")
-            else: self.backend = "openai"; self._init()
+            backends_to_try.extend(["openai", "huggingface"])
         elif self.backend == "openai":
-            if self._init_openai(): print(f"[LLMReasoner] ✓ OpenAI: {OPENAI_MODEL}")
-            else: self.backend = "huggingface"; self._init_hf()
-        else:
-            self._init_hf()
+            backends_to_try.extend(["huggingface"])
 
-    def _init_gemini(self):
+        for b in backends_to_try:
+            self.backend = b
+            if b == "gemini" and self._init_gemini():
+                logger.info("✓ Gemini: %s", GEMINI_MODEL)
+                return
+            elif b == "groq" and self._init_groq():
+                logger.info("✓ Groq: %s", GROQ_MODEL)
+                return
+            elif b == "ollama" and self._check_ollama():
+                logger.info("✓ Ollama: %s", OLLAMA_MODEL)
+                return
+            elif b == "openai" and self._init_openai():
+                logger.info("✓ OpenAI: %s", OPENAI_MODEL)
+                return
+            elif b == "huggingface":
+                self._init_hf()
+                return
+
+    def _init_gemini(self) -> bool:
+        """Initialize Gemini client without wasteful test calls."""
         key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
         if not key:
-            print("[LLMReasoner] No GEMINI_API_KEY → https://aistudio.google.com/apikey")
+            logger.warning("No GEMINI_API_KEY → https://aistudio.google.com/apikey")
             return False
         try:
             import google.generativeai as genai
             genai.configure(api_key=key)
             self._gemini_client = genai.GenerativeModel(GEMINI_MODEL)
-            self._gemini_client.generate_content(
-                "hi", generation_config={"max_output_tokens": 3})
             return True
         except ImportError:
-            print("[LLMReasoner] Run: pip install google-generativeai"); return False
+            logger.warning("Run: pip install google-generativeai")
+            return False
         except Exception as e:
-            print(f"[LLMReasoner] Gemini error: {e}"); return False
+            logger.warning("Gemini error: %s", e)
+            return False
 
-    def _init_groq(self):
+    def _init_groq(self) -> bool:
+        """Initialize Groq client without wasteful test calls."""
         key = GROQ_API_KEY or os.getenv("GROQ_API_KEY", "")
         if not key:
-            print("[LLMReasoner] No GROQ_API_KEY → https://console.groq.com")
+            logger.warning("No GROQ_API_KEY → https://console.groq.com")
             return False
         try:
             from groq import Groq
             self._groq_client = Groq(api_key=key)
-            self._groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role":"user","content":"hi"}], max_tokens=3)
             return True
         except ImportError:
-            print("[LLMReasoner] Run: pip install groq"); return False
+            logger.warning("Run: pip install groq")
+            return False
         except Exception as e:
-            print(f"[LLMReasoner] Groq error: {e}"); return False
+            logger.warning("Groq error: %s", e)
+            return False
 
-    def _check_ollama(self):
+    def _check_ollama(self) -> bool:
+        """Check if Ollama is available."""
         try:
             import requests
             r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
             if r.status_code == 200:
                 models = [m["name"] for m in r.json().get("models", [])]
                 return any(OLLAMA_MODEL.split(":")[0] in m for m in models)
-        except Exception: pass
+        except Exception:
+            pass
         return False
 
-    def _init_openai(self):
+    def _init_openai(self) -> bool:
+        """Initialize OpenAI client."""
         key = OPENAI_API_KEY or os.getenv("OPENAI_API_KEY", "")
-        if not key: return False
+        if not key:
+            return False
         try:
             from openai import OpenAI
-            self._oai_client = OpenAI(api_key=key); return True
-        except ImportError: return False
+            self._oai_client = OpenAI(api_key=key)
+            return True
+        except ImportError:
+            return False
 
-    def _init_hf(self):
+    def _init_hf(self) -> None:
+        """Initialize HuggingFace client."""
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-        print(f"[LLMReasoner] Loading {HF_MODEL}...")
+        logger.info("Loading %s...", HF_MODEL)
         self._hf_tokenizer = AutoTokenizer.from_pretrained(HF_MODEL)
-        self._hf_model     = AutoModelForSeq2SeqLM.from_pretrained(HF_MODEL)
-        print("[LLMReasoner] ✓ HuggingFace loaded.")
+        self._hf_model = AutoModelForSeq2SeqLM.from_pretrained(HF_MODEL)
+        logger.info("✓ HuggingFace loaded.")
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def generate(self, prompt, max_tokens=128, temperature=0.0):
+    def generate(self, prompt: str, max_tokens: int = 128, temperature: float = 0.0) -> str:
+        """
+        Generate a response from the configured LLM backend.
+        
+        Args:
+            prompt: The input prompt.
+            max_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+            
+        Returns:
+            The generated response string.
+        """
         _limiter.wait()
         for attempt in range(MAX_RETRIES):
             try:
-                if   self.backend == "gemini": return self._gemini_generate(prompt, max_tokens, temperature)
-                elif self.backend == "groq":   return self._groq_generate(prompt, max_tokens, temperature)
-                elif self.backend == "ollama": return self._ollama_generate(prompt, max_tokens, temperature)
-                elif self.backend == "openai": return self._oai_generate(prompt, max_tokens, temperature)
-                else:                          return self._hf_generate(prompt, max_tokens)
+                if self.backend == "gemini":
+                    return self._gemini_generate(prompt, max_tokens, temperature)
+                elif self.backend == "groq":
+                    return self._groq_generate(prompt, max_tokens, temperature)
+                elif self.backend == "ollama":
+                    return self._ollama_generate(prompt, max_tokens, temperature)
+                elif self.backend == "openai":
+                    return self._oai_generate(prompt, max_tokens, temperature)
+                else:
+                    return self._hf_generate(prompt, max_tokens)
             except Exception as e:
                 msg = str(e).lower()
                 if "429" in msg or "rate" in msg or "quota" in msg or "too many" in msg:
-                    wait = self._parse_retry_after(e) or (RETRY_WAIT_SECONDS * (attempt+1))
-                    print(f"[LLMReasoner] Rate limited. Waiting {wait}s...")
+                    wait = self._parse_retry_after(e) or (RETRY_WAIT_SECONDS * (attempt + 1))
+                    logger.warning("Rate limited. Waiting %ds...", wait)
                     time.sleep(wait)
                 else:
-                    print(f"[LLMReasoner] Error: {e}")
+                    logger.error("Error generating response: %s", e)
                     return "I don't know."
         return "I don't know."
 
-    def _parse_retry_after(self, error):
+    def _parse_retry_after(self, error: Exception) -> Optional[int]:
+        """Extract retry wait time from error message."""
         try:
             m = re.search(r"(\d+\.?\d*)\s*s", str(error), re.IGNORECASE)
             return int(float(m.group(1))) + 2 if m else None
-        except Exception: return None
+        except Exception:
+            return None
 
-    def answer_with_context(self, question, context_passages):
+    def answer_with_context(self, question: str, context_passages: List[str]) -> str:
         """
-        Chain-of-Thought answering:
-        1. Show few-shot CoT examples
-        2. Give context + question
-        3. Ask model to reason step-by-step
-        4. Extract final answer from reasoning
+        Chain-of-Thought answering using context.
+        
+        Args:
+            question: The question to answer.
+            context_passages: List of context documents.
+            
+        Returns:
+            The extracted final answer.
         """
-        limit    = 3000 if self.backend in ("gemini","groq","openai","ollama") else 600
+        limit_api = getattr(config, 'MAX_CONTEXT_CHARS_API', 3000)
+        limit_local = getattr(config, 'MAX_CONTEXT_CHARS_LOCAL', 600)
+        limit = limit_api if self.backend in ("gemini", "groq", "openai", "ollama") else limit_local
+        
         combined = " ".join(p.strip() for p in context_passages)[:limit]
 
         if self.backend == "huggingface":
             raw = self.generate(
                 f"Context: {combined}\n\nQuestion: {question}\nAnswer:",
-                max_tokens=32)
+                max_tokens=32
+            )
             return self._extract_final_answer(raw)
 
-        # Chain-of-Thought prompt
         prompt = (
             f"{COT_FEW_SHOT}"
             f"Now answer this question using the context below.\n"
@@ -195,19 +256,33 @@ class LLMReasoner:
             f"Q: {question}\n"
             f"Reasoning:"
         )
-        # Allow more tokens for reasoning
         raw = self.generate(prompt, max_tokens=80)
         return self._extract_final_answer(raw)
 
-    def answer_with_sub_answers(self, question, sub_answers, context_passages):
-        limit    = 2500 if self.backend in ("gemini","groq","openai","ollama") else 400
+    def answer_with_sub_answers(self, question: str, sub_answers: List[str], context_passages: List[str]) -> str:
+        """
+        Chain-of-Thought answering using context and intermediate sub-answers.
+        
+        Args:
+            question: The question to answer.
+            sub_answers: Intermediate answers from sub-questions.
+            context_passages: List of context documents.
+            
+        Returns:
+            The extracted final answer.
+        """
+        limit_api = getattr(config, 'MAX_CONTEXT_CHARS_API', 3000)
+        limit_local = getattr(config, 'MAX_CONTEXT_CHARS_LOCAL', 600)
+        limit = limit_api - 500 if self.backend in ("gemini", "groq", "openai", "ollama") else limit_local - 200
+        
         combined = " ".join(p.strip() for p in context_passages)[:limit]
-        hints    = " | ".join(sub_answers)
+        hints = " | ".join(sub_answers)
 
         if self.backend == "huggingface":
             raw = self.generate(
                 f"Context: {combined} {hints}\n\nQuestion: {question}\nAnswer:",
-                max_tokens=32)
+                max_tokens=32
+            )
             return self._extract_final_answer(raw)
 
         prompt = (
@@ -225,25 +300,23 @@ class LLMReasoner:
     def _extract_final_answer(self, raw: str) -> str:
         """
         Extract the Answer from CoT output.
-        CoT output looks like:
-          "The film was directed by X. X was born in Y.
-           Answer: Y"
-        We extract whatever comes after "Answer:"
+        
+        Args:
+            raw: The raw LLM generation.
+            
+        Returns:
+            The extracted and cleaned answer.
         """
         if not raw:
             return ""
 
-        # Try to find explicit "Answer:" marker
         if "answer:" in raw.lower():
             parts = re.split(r"answer\s*:", raw, flags=re.IGNORECASE)
             if len(parts) > 1:
                 answer_part = parts[-1].strip()
-                # Take just first line of the answer
                 answer_part = answer_part.split("\n")[0].strip()
                 return self._clean(answer_part)
 
-        # No "Answer:" found — treat whole thing as answer
-        # Take last sentence/phrase (likely the conclusion)
         lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
         if lines:
             return self._clean(lines[-1])
@@ -251,15 +324,20 @@ class LLMReasoner:
         return self._clean(raw)
 
     def _clean(self, answer: str) -> str:
-        """Clean up the extracted answer."""
+        """
+        Clean up the extracted answer.
+        
+        Args:
+            answer: Raw extracted answer.
+            
+        Returns:
+            Cleaned answer.
+        """
         if not answer:
             return ""
         a = answer.strip()
-
-        # Remove quotes
         a = a.strip('"\'')
 
-        # Remove common prefixes
         prefixes = [
             r"^the answer is[:\s]+",
             r"^answer[:\s]+",
@@ -270,35 +348,27 @@ class LLMReasoner:
         for pat in prefixes:
             a = re.sub(pat, "", a, flags=re.IGNORECASE).strip()
 
-        # yes/no: keep just the word
         if re.match(r"^(yes|no)[,\.\s]", a, re.IGNORECASE):
             return a.split()[0].lower()
 
-        # "X is the Y of Z" → "X"
-        match = re.match(
-            r"^(.+?)\s+(is|was|are|were)\s+(the|a|an)\s+",
-            a, re.IGNORECASE)
+        match = re.match(r"^(.+?)\s+(is|was|are|were)\s+(the|a|an)\s+", a, re.IGNORECASE)
         if match:
             candidate = match.group(1).strip()
+            # Only apply if candidate length seems reasonable
             if 1 <= len(candidate.split()) <= 5:
                 a = candidate
 
-        # Remove parenthetical info
         a = re.sub(r"\s*\(.*?\)", "", a)
-
-        # Remove trailing punctuation
         a = a.strip().rstrip(".,;:\"'")
 
-        # If still too long take first 5 words
+        max_words = getattr(config, 'MAX_ANSWER_WORDS', 8)
         words = a.split()
-        if len(words) > 6:
-            a = " ".join(words[:5])
+        if len(words) > max_words + 1:
+            a = " ".join(words[:max_words])
 
         return a.strip()
 
-    # ── Backends ──────────────────────────────────────────────────────────────
-
-    def _gemini_generate(self, prompt, max_tokens, temperature):
+    def _gemini_generate(self, prompt: str, max_tokens: int, temperature: float) -> str:
         import google.generativeai as genai
         response = self._gemini_client.generate_content(
             prompt,
@@ -309,37 +379,47 @@ class LLMReasoner:
         )
         return response.text.strip()
 
-    def _groq_generate(self, prompt, max_tokens, temperature):
+    def _groq_generate(self, prompt: str, max_tokens: int, temperature: float) -> str:
         r = self._groq_client.chat.completions.create(
             model=GROQ_MODEL,
-            messages=[{"role":"user","content":prompt}],
-            max_tokens=max_tokens, temperature=temperature,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         return r.choices[0].message.content.strip()
 
-    def _ollama_generate(self, prompt, max_tokens, temperature):
+    def _ollama_generate(self, prompt: str, max_tokens: int, temperature: float) -> str:
         import requests
-        r = requests.post(f"{OLLAMA_BASE_URL}/api/generate",
-            json={"model":OLLAMA_MODEL,"prompt":prompt,"stream":False,
-                  "options":{"num_predict":max_tokens,"temperature":temperature}},
-            timeout=60)
+        r = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_predict": max_tokens, "temperature": temperature}
+            },
+            timeout=60
+        )
         r.raise_for_status()
-        return r.json().get("response","").strip()
+        return r.json().get("response", "").strip()
 
-    def _oai_generate(self, prompt, max_tokens, temperature):
+    def _oai_generate(self, prompt: str, max_tokens: int, temperature: float) -> str:
         r = self._oai_client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role":"user","content":prompt}],
-            max_tokens=max_tokens, temperature=temperature,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         return r.choices[0].message.content.strip()
 
-    def _hf_generate(self, prompt, max_tokens):
+    def _hf_generate(self, prompt: str, max_tokens: int) -> str:
         import torch
         inputs = self._hf_tokenizer(
-            prompt, return_tensors="pt", truncation=True, max_length=512)
+            prompt, return_tensors="pt", truncation=True, max_length=512
+        )
         with torch.no_grad():
             out = self._hf_model.generate(
                 **inputs, max_new_tokens=max_tokens,
-                do_sample=False, num_beams=4, early_stopping=True)
+                do_sample=False, num_beams=4, early_stopping=True
+            )
         return self._hf_tokenizer.decode(out[0], skip_special_tokens=True).strip()

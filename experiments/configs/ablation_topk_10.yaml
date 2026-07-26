@@ -1,0 +1,35 @@
+name: ablation_topk_10
+description: top_k = 10
+seeds:
+- 42
+- 123
+- 456
+retrieval:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  top_k: 10
+  bm25_weight: 0.3
+  dense_weight: 0.7
+  fusion_method: linear
+  enabled: true
+healing:
+  enabled: true
+  max_correction_attempts: 2
+  confidence_threshold: 0.6
+  use_nli_grounding: true
+  nli_model: cross-encoder/nli-deberta-v3-small
+  decompose_questions: true
+llm:
+  backend: gemini
+  temperature: 0.0
+  max_answer_words: 8
+  context_char_limit: 3000
+dataset:
+  name: hotpotqa
+  split: validation
+  n_samples: 100
+metrics:
+- em
+- f1
+- rouge_l
+- faithfulness
+compare_baseline: true

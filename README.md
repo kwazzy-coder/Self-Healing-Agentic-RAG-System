@@ -47,35 +47,49 @@ This project implements a **Self-Healing Agentic RAG system** with four core cap
 self_healing_rag/
 │
 ├── README.md                    ← This file
-├── REPORT.md                    ← Full technical report with architecture, experiments, expected results
+├── REPORT.md                    ← Full technical report with architecture & results
 ├── WHAT_TO_DO.md                ← Step-by-step guide to reproduce all experiments
-├── requirements.txt             ← All Python dependencies
-├── config.py                    ← Central configuration: LLM backends, hyperparameters, paths
+├── requirements.txt             ← Pinned Python dependencies (reproducibility)
+├── config.py                    ← Central configuration + ExperimentConfig dataclass
 │
 ├── pipeline.py                  ← Main RAG pipeline orchestrator (start here)
 ├── run_evaluation.py            ← CLI entry point — runs full evaluation
-├── demo.py                      ← Quick 3-sample smoke test (no API key needed)
+├── demo.py                      ← Quick 5-sample smoke test
 │
 ├── data/                        ← Dataset loading modules
 │   ├── hotpotqa_loader.py       ← Loads & samples HotpotQA validation set
 │   └── ragbench_loader.py       ← Loads & samples RAGBench subsets
 │
 ├── retrieval/                   ← Document retrieval
-│   ├── vector_store.py          ← FAISS-based dense vector index management
-│   └── retriever.py             ← Hybrid BM25 (30%) + FAISS dense (70%) retriever
+│   ├── vector_store.py          ← FAISS-based dense vector index (cosine similarity)
+│   └── retriever.py             ← Hybrid BM25 + FAISS with linear/RRF fusion
 │
 ├── agent/                       ← Agentic reasoning components
-│   ├── task_planner.py          ← Detects question type; decomposes multi-hop into sub-questions
-│   ├── llm_reasoner.py          ← All LLM calls (Gemini / Groq / Ollama / OpenAI / HuggingFace)
-│   ├── self_monitor.py          ← Self-healing core: 4-check failure detection
-│   └── corrective_actions.py   ← 3 corrective strategies: reformulate, re-retrieve, decompose
+│   ├── task_planner.py          ← Question type detection + multi-hop decomposition
+│   ├── llm_reasoner.py          ← Multi-backend LLM with CoT prompting & rate limiting
+│   ├── self_monitor.py          ← 4-check failure detection with NLI-based grounding
+│   └── corrective_actions.py    ← Action-driven correction: expand, decompose, reformulate
 │
-├── evaluation/                  ← Metrics and evaluation harness
-│   ├── metrics.py               ← EM, F1, faithfulness, hallucination rate, correction rate
-│   └── evaluator.py             ← End-to-end evaluation pipeline; generates results JSON
+├── evaluation/                  ← Publication-quality evaluation suite
+│   ├── metrics.py               ← EM, F1, ROUGE-L, BERTScore, retrieval metrics
+│   ├── faithfulness.py          ← RAG Triad: faithfulness, relevancy, context relevancy
+│   ├── statistical.py           ← Bootstrap CI, paired significance tests, McNemar
+│   └── evaluator.py             ← End-to-end evaluation with per-type breakdown
+│
+├── experiments/                 ← Experiment infrastructure
+│   ├── config_schema.py         ← Pydantic schema for experiment configs
+│   ├── runner.py                ← Multi-seed experiment runner with metadata logging
+│   ├── run_all_experiments.py   ← Master script for all ablations
+│   └── configs/                 ← 12 YAML configs (full system, baselines, ablations)
+│
+├── analysis/                    ← Paper-ready analysis tools
+│   ├── result_analyzer.py       ← LaTeX table generation, system comparison
+│   ├── visualizations.py        ← Publication-quality plots (matplotlib/seaborn)
+│   ├── error_analysis.py        ← Failure categorization & pattern analysis
+│   └── case_studies.py          ← Qualitative case study extraction
 │
 └── utils/
-    └── helpers.py               ← Tokenization, text normalization utilities
+    └── helpers.py               ← Text processing, logging setup, system info
 ```
 
 ### Key files at a glance
