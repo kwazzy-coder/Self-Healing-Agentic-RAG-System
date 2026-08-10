@@ -14,6 +14,7 @@ from agent.llm_reasoner import LLMReasoner
 from agent.task_planner import TaskPlanner
 from agent.self_monitor import SelfMonitor
 from agent.corrective_actions import CorrectiveActions
+from agent.cost_tracker import CostTracker
 from retrieval.retriever import HybridRetriever
 from config import MAX_CORRECTION_ATTEMPTS
 
@@ -36,6 +37,7 @@ class PipelineResult:
     failure_reason: str
     trace: List[str]
     component_latencies: Dict[str, float] = field(default_factory=dict)
+    cost_data: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -55,9 +57,10 @@ class SelfHealingRAGPipeline:
         logger.info("[Pipeline] Initialising Self-Healing RAG...")
         self.llm = LLMReasoner()
         self.retriever = HybridRetriever()
+        self.cost_tracker = CostTracker()
         self.planner = TaskPlanner(self.llm)
-        self.monitor = SelfMonitor(self.llm)
-        self.corrector = CorrectiveActions(self.llm, self.retriever)
+        self.monitor = SelfMonitor(self.llm, cost_tracker=self.cost_tracker)
+        self.corrector = CorrectiveActions(self.llm, self.retriever, cost_tracker=self.cost_tracker)
         logger.info("[Pipeline] Ready.")
 
     def run(self, question: str, documents: List[str], question_type: Optional[str] = None) -> PipelineResult:
@@ -75,49 +78,53 @@ class SelfHealingRAGPipeline:
         trace = []
         latencies = {}
         self.corrector.reset_round()
+        self.cost_tracker.reset_query()
 
         # Step 1: Index
-        start_t = time.time()
-        self.retriever.index_documents(documents)
-        latencies["index"] = time.time() - start_t
+        with self.cost_tracker.time_component("index"):
+            self.retriever.index_documents(documents)
 
         # Step 2: Plan
-        start_t = time.time()
-        plan = self.planner.plan(question, question_type)
-        latencies["plan"] = time.time() - start_t
+        with self.cost_tracker.time_component("plan"):
+            plan = self.planner.plan(question, question_type)
         trace.append(f"plan: strategy={plan['strategy']}, sub_qs={plan['sub_questions']}")
 
         # Step 3: Retrieve
-        start_t = time.time()
-        retrieved = self.retriever.retrieve(question)
+        with self.cost_tracker.time_component("retrieve"):
+            retrieved = self.retriever.retrieve(question)
+            self.cost_tracker.record_retrieval_call()
         # Handle RetrievalResult objects instead of dicts now
         retrieved_docs = [r.text if hasattr(r, 'text') else r["text"] for r in retrieved]
-        latencies["retrieve"] = time.time() - start_t
         trace.append(f"retrieved {len(retrieved_docs)} docs")
 
         # Step 4: Generate
-        start_t = time.time()
-        sub_answers = []
+        with self.cost_tracker.time_component("generate"):
+            sub_answers = []
 
-        if plan["strategy"] != "direct" and plan["sub_questions"]:
-            for sq in plan["sub_questions"]:
-                extra = self.retriever.retrieve(sq)
-                extra_docs = [r.text if hasattr(r, 'text') else r["text"] for r in extra]
-                all_docs = list(dict.fromkeys(retrieved_docs + extra_docs))[:MAX_DOCS_PER_QUERY]
-                sa = self.llm.answer_with_context(sq, all_docs)
-                sub_answers.append(sa)
-                trace.append(f"sub-answer: '{sq[:50]}' -> '{sa[:50]}'")
-            answer = self.llm.answer_with_sub_answers(question, sub_answers, retrieved_docs)
+            if plan["strategy"] != "direct" and plan["sub_questions"]:
+                for sq in plan["sub_questions"]:
+                    extra = self.retriever.retrieve(sq)
+                    self.cost_tracker.record_retrieval_call()
+                    extra_docs = [r.text if hasattr(r, 'text') else r["text"] for r in extra]
+                    all_docs = list(dict.fromkeys(retrieved_docs + extra_docs))[:MAX_DOCS_PER_QUERY]
+                    sa = self.llm.answer_with_context(sq, all_docs)
+                    self.cost_tracker.record_llm_call()
+                    sub_answers.append(sa)
+                    trace.append(f"sub-answer: '{sq[:50]}' -> '{sa[:50]}'")
+                answer = self.llm.answer_with_sub_answers(question, sub_answers, retrieved_docs)
+                self.cost_tracker.record_llm_call()
 
-        elif plan["strategy"] != "direct" and not plan["sub_questions"]:
-            all_retrieved = self.retriever.retrieve(question, top_k=len(documents))
-            retrieved_docs = [r.text if hasattr(r, 'text') else r["text"] for r in all_retrieved]
-            answer = self.llm.answer_with_context(question, retrieved_docs)
-            trace.append(f"multi-hop direct: using {len(retrieved_docs)} docs")
-        else:
-            answer = self.llm.answer_with_context(question, retrieved_docs)
+            elif plan["strategy"] != "direct" and not plan["sub_questions"]:
+                all_retrieved = self.retriever.retrieve(question, top_k=len(documents))
+                self.cost_tracker.record_retrieval_call()
+                retrieved_docs = [r.text if hasattr(r, 'text') else r["text"] for r in all_retrieved]
+                answer = self.llm.answer_with_context(question, retrieved_docs)
+                self.cost_tracker.record_llm_call()
+                trace.append(f"multi-hop direct: using {len(retrieved_docs)} docs")
+            else:
+                answer = self.llm.answer_with_context(question, retrieved_docs)
+                self.cost_tracker.record_llm_call()
 
-        latencies["generate"] = time.time() - start_t
         trace.append(f"initial answer: '{answer[:100]}'")
 
         # KEY: track best answer seen across all rounds
@@ -133,14 +140,13 @@ class SelfHealingRAGPipeline:
         correction_latency = 0.0
 
         for attempt in range(MAX_CORRECTION_ATTEMPTS):
-            start_t = time.time()
-            report = self.monitor.evaluate(
-                question=question,
-                answer=answer,
-                retrieved_docs=retrieved_docs,
-                sub_answers=sub_answers or None,
-            )
-            monitor_latency += time.time() - start_t
+            with self.cost_tracker.time_component("monitor"):
+                report = self.monitor.evaluate(
+                    question=question,
+                    answer=answer,
+                    retrieved_docs=retrieved_docs,
+                    sub_answers=sub_answers or None,
+                )
 
             if not report.has_failure:
                 trace.append(f"self-monitor: PASS (attempt {attempt})")
@@ -155,15 +161,14 @@ class SelfHealingRAGPipeline:
             )
 
             correction_attempted = True
-            start_t = time.time()
-            correction = self.corrector.apply(
-                action=report.suggested_action,
-                question=question,
-                previous_answer=answer,
-                retrieved_docs=retrieved_docs,
-                ungrounded_sentences=report.ungrounded_sentences,
-            )
-            correction_latency += time.time() - start_t
+            with self.cost_tracker.time_component("correction"):
+                correction = self.corrector.apply(
+                    action=report.suggested_action,
+                    question=question,
+                    previous_answer=answer,
+                    retrieved_docs=retrieved_docs,
+                    ungrounded_sentences=report.ungrounded_sentences,
+                )
 
             new_answer = correction["new_answer"]
             retrieved_docs = correction["new_docs"]
@@ -175,8 +180,7 @@ class SelfHealingRAGPipeline:
                 answer = new_answer
                 best_answer = new_answer  # track best
                 
-        latencies["monitor"] = monitor_latency
-        latencies["correction"] = correction_latency
+        cost = self.cost_tracker.finalize_query()
 
         return PipelineResult(
             final_answer=best_answer.strip().rstrip("."),
@@ -186,7 +190,8 @@ class SelfHealingRAGPipeline:
             n_correction_rounds=n_rounds,
             failure_reason=failure_reason,
             trace=trace,
-            component_latencies=latencies
+            component_latencies=cost.component_latencies,
+            cost_data=cost.to_dict()
         )
 
     def run_baseline(self, question: str, documents: List[str]) -> BaselineResult:

@@ -59,60 +59,109 @@ def apply_config_overrides(config: ExperimentConfig):
     # LLM Config
     system_config.LLM_BACKEND = config.llm.backend
     if config.llm.model_name:
-        system_config.LLM_MODEL_NAME = config.llm.model_name
-    system_config.LLM_TEMPERATURE = config.llm.temperature
-    system_config.MAX_ANSWER_WORDS = config.llm.max_answer_words
-    system_config.CONTEXT_CHAR_LIMIT = config.llm.context_char_limit
+        if config.llm.backend == "gemini":
+            system_config.GEMINI_MODEL = config.llm.model_name
+        elif config.llm.backend == "groq":
+            system_config.GROQ_MODEL = config.llm.model_name
+        elif config.llm.backend == "ollama":
+            system_config.OLLAMA_MODEL = config.llm.model_name
+        elif config.llm.backend == "openai":
+            system_config.OPENAI_MODEL = config.llm.model_name
+        elif config.llm.backend == "huggingface":
+            system_config.HF_MODEL = config.llm.model_name
+            
+    if hasattr(config.llm, "temperature"):
+        system_config.TEMPERATURE = config.llm.temperature
+    if hasattr(config.llm, "max_answer_words"):
+        system_config.MAX_ANSWER_WORDS = config.llm.max_answer_words
+    if hasattr(config.llm, "context_char_limit"):
+        system_config.CONTEXT_CHAR_LIMIT = config.llm.context_char_limit
 
     # Retrieval Config
-    system_config.EMBEDDING_MODEL = config.retrieval.embedding_model
-    system_config.RETRIEVER_TOP_K = config.retrieval.top_k
-    system_config.BM25_WEIGHT = config.retrieval.bm25_weight
-    system_config.DENSE_WEIGHT = config.retrieval.dense_weight
-    system_config.FUSION_METHOD = config.retrieval.fusion_method
-    system_config.RETRIEVAL_ENABLED = config.retrieval.enabled
+    if hasattr(config.retrieval, "embedding_model"):
+        system_config.EMBEDDING_MODEL = config.retrieval.embedding_model
+    if hasattr(config.retrieval, "top_k"):
+        system_config.TOP_K_RETRIEVAL = config.retrieval.top_k
+    if hasattr(config.retrieval, "bm25_weight"):
+        system_config.BM25_WEIGHT = config.retrieval.bm25_weight
+    if hasattr(config.retrieval, "dense_weight"):
+        system_config.DENSE_WEIGHT = config.retrieval.dense_weight
+    if hasattr(config.retrieval, "fusion_method"):
+        system_config.RETRIEVAL_FUSION_METHOD = config.retrieval.fusion_method
 
     # Healing Config
-    system_config.HEALING_ENABLED = config.healing.enabled
-    system_config.MAX_CORRECTION_ATTEMPTS = config.healing.max_correction_attempts
-    system_config.CONFIDENCE_THRESHOLD = config.healing.confidence_threshold
-    system_config.USE_NLI_GROUNDING = config.healing.use_nli_grounding
-    system_config.NLI_MODEL = config.healing.nli_model
-    system_config.DECOMPOSE_QUESTIONS = config.healing.decompose_questions
+    if hasattr(config.healing, "max_correction_attempts"):
+        system_config.MAX_CORRECTION_ATTEMPTS = config.healing.max_correction_attempts
+    if hasattr(config.healing, "confidence_threshold"):
+        system_config.CONFIDENCE_THRESHOLD = config.healing.confidence_threshold
+        
+    if getattr(config.healing, "decompose_questions", False):
+        # We handle decompose_questions by patching the TaskPlanner behavior in run_evaluation
+        pass
 
 def run_evaluation(config: ExperimentConfig, seed: int) -> Dict[str, Any]:
     """
     Run the evaluation pipeline for a single seed.
-    Placeholder for actual pipeline invocation.
     """
+    from pipeline import SelfHealingRAGPipeline
+    from evaluation.evaluator import Evaluator
+    
+    # Load dataset
+    if config.dataset.name == "hotpotqa":
+        from data.hotpotqa_loader import load_hotpotqa
+        setting = getattr(config.dataset, "subset", "distractor")
+        samples = load_hotpotqa(n_samples=config.dataset.n_samples, setting=setting)
+    elif config.dataset.name == "ragbench":
+        from data.ragbench_loader import load_ragbench
+        subset = getattr(config.dataset, "subset", "covidqa")
+        split = getattr(config.dataset, "split", "test")
+        samples = load_ragbench(subset=subset, split=split, n_samples=config.dataset.n_samples)
+    else:
+        raise ValueError(f"Unknown dataset: {config.dataset.name}")
+        
+    pipeline = SelfHealingRAGPipeline()
+    evaluator = Evaluator(pipeline)
+    
+    healing_enabled = getattr(config.healing, "enabled", True)
+    decompose_questions = getattr(config.healing, "decompose_questions", True)
+    
+    # Temporarily patch TaskPlanner behavior if decompose_questions is disabled
+    import agent.task_planner as tp
+    original_plan = tp.TaskPlanner.plan
+    if not decompose_questions:
+        tp.TaskPlanner.plan = lambda self, q: [q]
+        
     try:
-        from evaluation.evaluator import RAGEvaluator
-        from evaluation.datasets import load_dataset
+        if not healing_enabled:
+            # Run baseline path when healing is disabled
+            pipeline.run = pipeline.run_baseline
+            
+        if config.dataset.name == "hotpotqa":
+            results = evaluator.evaluate_hotpotqa(samples, compare_baseline=not healing_enabled)
+        else:
+            results = evaluator.evaluate_ragbench(samples, subset=getattr(config.dataset, "subset", "covidqa"))
+            
+    finally:
+        # Restore TaskPlanner behavior
+        tp.TaskPlanner.plan = original_plan
         
-        dataset = load_dataset(config.dataset.name, split=config.dataset.split, 
-                               n_samples=config.dataset.n_samples, subset=config.dataset.subset)
-        
-        evaluator = RAGEvaluator(metrics=config.metrics)
-        results = evaluator.evaluate_dataset(dataset)
-        return results
-    except ImportError:
-        logger.warning("Could not import evaluation modules. Returning mock results.")
-        # Return mock results
-        return {metric: random.uniform(0.5, 0.9) for metric in config.metrics}
+    return results
 
 def compute_confidence_intervals(results_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
     """
     Compute mean and confidence intervals across seeds using evaluation.statistical.
     """
     try:
-        from evaluation.statistical import bootstrap_ci
+        from evaluation.statistical import bootstrap_confidence_interval
         aggregated = {}
-        # Simple extraction
+        if not results_list: return aggregated
         metrics = results_list[0].keys()
         for metric in metrics:
             values = [res[metric] for res in results_list if metric in res]
+            if not values:
+                continue
             mean_val = np.mean(values)
-            ci_lower, ci_upper = bootstrap_ci(values)
+            ci_lower, ci_upper = bootstrap_confidence_interval(values)
             aggregated[metric] = {
                 "mean": mean_val,
                 "ci_lower": ci_lower,
@@ -164,7 +213,6 @@ def run_experiment(config_path: str, output_dir: str = "results", dry_run: bool 
     final_report = {
         "experiment_name": config.name,
         "description": config.description,
-        "config": config.model_dump(),
         "metadata": get_system_metadata(),
         "execution_time_seconds": end_time - start_time,
         "seed_results": seed_results,

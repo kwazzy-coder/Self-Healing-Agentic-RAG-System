@@ -41,13 +41,15 @@ def compute_faithfulness(answer: str, context: List[str], llm: Any) -> float:
             text = text[:-3]
         claims = json.loads(text.strip())
         if not isinstance(claims, list):
-            return 0.0
+            import re
+            claims = [c.strip() for c in re.split(r'[.!?]+', answer) if c.strip()]
     except Exception:
         # Fallback if generation or parsing fails
-        return 0.0
+        import re
+        claims = [c.strip() for c in re.split(r'[.!?]+', answer) if c.strip()]
         
     if not claims:
-        return 1.0 # Empty claims mean no hallucination, technically faithful
+        return 0.0
         
     # 2. Verify claims
     context_str = "\n\n".join(context)

@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 **Option A — Free (no API key needed, slower):**
 ```bash
-export LLM_BACKEND=huggingface
+$env:LLM_BACKEND = "huggingface"
 ```
 
 **Option B — OpenAI (faster, better results, costs ~$1-2 for 200 samples):**

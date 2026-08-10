@@ -113,6 +113,13 @@ class HybridRetriever:
         for r in dense_results:
             dense_scores[r["idx"]] = r["score"]
 
+        dense_min = dense_scores.min()
+        dense_max = dense_scores.max()
+        if dense_max - dense_min > 0:
+            dense_norm = (dense_scores - dense_min) / (dense_max - dense_min + 1e-9)
+        else:
+            dense_norm = np.zeros_like(dense_scores)
+
         # -- Hybrid fusion --
         if RETRIEVAL_FUSION_METHOD == "rrf":
             # Reciprocal Rank Fusion
@@ -127,7 +134,7 @@ class HybridRetriever:
                 hybrid_scores[doc_idx] += 1.0 / (k + rank + 1)
         else:
             # Linear combination
-            hybrid_scores = BM25_WEIGHT * bm25_norm + DENSE_WEIGHT * dense_scores
+            hybrid_scores = BM25_WEIGHT * bm25_norm + DENSE_WEIGHT * dense_norm
 
         # -- Sort & return top-k --
         ranked = np.argsort(-hybrid_scores)[:top_k]

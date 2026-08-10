@@ -57,24 +57,35 @@ self_healing_rag/
 ├── demo.py                      ← Quick 5-sample smoke test
 │
 ├── data/                        ← Dataset loading modules
-│   ├── hotpotqa_loader.py       ← Loads & samples HotpotQA validation set
-│   └── ragbench_loader.py       ← Loads & samples RAGBench subsets
+│   ├── hotpotqa_loader.py       ← HotpotQA (multi-hop, 2-hop)
+│   ├── ragbench_loader.py       ← RAGBench subsets (COVID, MSMARCO, PubMed, ...)
+│   ├── musique_loader.py        ← MuSiQue (multi-hop, 2-4 hops)
+│   ├── nq_loader.py             ← Natural Questions (single-hop)
+│   └── popqa_loader.py          ← PopQA (long-tail entities)
 │
 ├── retrieval/                   ← Document retrieval
 │   ├── vector_store.py          ← FAISS-based dense vector index (cosine similarity)
-│   └── retriever.py             ← Hybrid BM25 + FAISS with linear/RRF fusion
+│   └── retriever.py             ← Hybrid BM25 + FAISS with normalized linear/RRF fusion
 │
 ├── agent/                       ← Agentic reasoning components
 │   ├── task_planner.py          ← Question type detection + multi-hop decomposition
 │   ├── llm_reasoner.py          ← Multi-backend LLM with CoT prompting & rate limiting
-│   ├── self_monitor.py          ← 4-check failure detection with NLI-based grounding
-│   └── corrective_actions.py    ← Action-driven correction: expand, decompose, reformulate
+│   ├── self_monitor.py          ← ★ 3-tier cascading monitor (heuristic → NLI → LLM)
+│   ├── corrective_actions.py    ← Failure-type-driven adaptive correction strategies
+│   └── cost_tracker.py          ← Per-query cost tracking (LLM calls, NLI, latency)
 │
 ├── evaluation/                  ← Publication-quality evaluation suite
 │   ├── metrics.py               ← EM, F1, ROUGE-L, BERTScore, retrieval metrics
 │   ├── faithfulness.py          ← RAG Triad: faithfulness, relevancy, context relevancy
 │   ├── statistical.py           ← Bootstrap CI, paired significance tests, McNemar
-│   └── evaluator.py             ← End-to-end evaluation with per-type breakdown
+│   ├── evaluator.py             ← End-to-end evaluation with per-type breakdown
+│   └── cost_analysis.py         ← Cost-efficiency tables & savings computation
+│
+├── baselines/                   ← SOTA baseline implementations for comparison
+│   ├── vanilla_rag.py           ← Standard RAG (no correction)
+│   ├── always_correct.py        ← Always-correct (no selective monitoring)
+│   ├── llm_judge_only.py        ← LLM-as-judge on every query (no tiered approach)
+│   └── crag_baseline.py         ← CRAG-style document grading + re-retrieval
 │
 ├── experiments/                 ← Experiment infrastructure
 │   ├── config_schema.py         ← Pydantic schema for experiment configs
@@ -87,6 +98,9 @@ self_healing_rag/
 │   ├── visualizations.py        ← Publication-quality plots (matplotlib/seaborn)
 │   ├── error_analysis.py        ← Failure categorization & pattern analysis
 │   └── case_studies.py          ← Qualitative case study extraction
+│
+├── paper/                       ← Paper generation utilities
+│   └── algorithm.py             ← LaTeX pseudocode (Algorithm 1 & 2)
 │
 └── utils/
     └── helpers.py               ← Text processing, logging setup, system info

@@ -251,12 +251,12 @@ class LLMReasoner:
             f"{COT_FEW_SHOT}"
             f"Now answer this question using the context below.\n"
             f"First write your Reasoning (1-2 sentences), "
-            f"then write Answer (1-4 words only).\n\n"
+            f"then write Answer (brief, just the answer).\n\n"
             f"Context: {combined}\n\n"
             f"Q: {question}\n"
             f"Reasoning:"
         )
-        raw = self.generate(prompt, max_tokens=80)
+        raw = self.generate(prompt, max_tokens=200)
         return self._extract_final_answer(raw)
 
     def answer_with_sub_answers(self, question: str, sub_answers: List[str], context_passages: List[str]) -> str:
@@ -288,13 +288,13 @@ class LLMReasoner:
         prompt = (
             f"{COT_FEW_SHOT}"
             f"Use the context and intermediate findings.\n"
-            f"First write Reasoning (1-2 sentences), then Answer (1-4 words).\n\n"
+            f"First write Reasoning (1-2 sentences), then Answer (brief, just the answer).\n\n"
             f"Context: {combined}\n"
             f"Findings: {hints}\n\n"
             f"Q: {question}\n"
             f"Reasoning:"
         )
-        raw = self.generate(prompt, max_tokens=80)
+        raw = self.generate(prompt, max_tokens=200)
         return self._extract_final_answer(raw)
 
     def _extract_final_answer(self, raw: str) -> str:
