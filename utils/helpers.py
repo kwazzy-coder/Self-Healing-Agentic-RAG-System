@@ -1,6 +1,6 @@
 """
 utils/helpers.py
-Shared utilities: text processing, normalization, logging.
+Shared utilities: text processing, normalization, logging, and environment info.
 """
 
 import re
@@ -8,29 +8,77 @@ import string
 import time
 import functools
 import logging
+import hashlib
+import platform
+import sys
+from typing import List, Callable, Any, Dict
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def setup_logging(level: str = "INFO") -> None:
+    """
+    Configures basic logging.
+    
+    Args:
+        level: Logging level as a string (e.g., 'INFO', 'DEBUG').
+    """
+    numeric_level = getattr(logging, level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError(f"Invalid log level: {level}")
+        
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True
+    )
+    logger.info(f"Logging initialized at {level} level.")
+
+
 def clean_text(text: str) -> str:
-    """Remove extra whitespace and newlines."""
+    """
+    Removes extra whitespace and newlines from text.
+    
+    Args:
+        text: Input string.
+        
+    Returns:
+        Cleaned string.
+    """
     return " ".join(text.split())
 
 
 def truncate_text(text: str, max_chars: int = 500) -> str:
-    """Truncate text for display/prompt use."""
+    """
+    Truncates text for display or prompt usage.
+    
+    Args:
+        text: Input string.
+        max_chars: Maximum characters to retain before truncating.
+        
+    Returns:
+        Truncated string with trailing ellipsis if needed.
+    """
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "..."
 
 
-def deduplicate_docs(docs: list[str]) -> list[str]:
-    """Remove duplicate passages (exact match)."""
+def deduplicate_docs(docs: List[str]) -> List[str]:
+    """
+    Removes duplicate passages based on full text SHA-256 hash.
+    
+    Args:
+        docs: List of document strings.
+        
+    Returns:
+        Deduplicated list of document strings.
+    """
     seen = set()
     result = []
     for d in docs:
-        key = d.strip().lower()[:100]
+        cleaned = d.strip().lower()
+        key = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
         if key not in seen:
             seen.add(key)
             result.append(d)
@@ -38,48 +86,43 @@ def deduplicate_docs(docs: list[str]) -> list[str]:
 
 
 def extract_title_from_doc(doc: str) -> str:
-    """Extract title from 'Title: X\n...' formatted passages."""
+    """
+    Extracts the title from passages formatted as 'Title: X\n...'.
+    
+    Args:
+        doc: The input document string.
+        
+    Returns:
+        The extracted title, or an empty string if not found.
+    """
     match = re.match(r"Title:\s*(.+?)(?:\n|$)", doc)
     return match.group(1).strip() if match else ""
 
 
-def timer(func):
-    """Decorator to time function calls."""
+def timer(func: Callable) -> Callable:
+    """
+    Decorator to time function execution and log at INFO level.
+    """
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args, **kwargs) -> Any:
         start = time.time()
         result = func(*args, **kwargs)
         elapsed = time.time() - start
-        logger.debug(f"{func.__name__} took {elapsed:.2f}s")
+        logger.info(f"Timer: {func.__name__} took {elapsed:.2f}s")
         return result
     return wrapper
 
 
-def format_results_table(metrics_list: list[tuple[str, dict]]) -> str:
+def get_system_info() -> Dict[str, str]:
     """
-    Format a list of (system_name, metrics_dict) into a readable comparison table.
+    Retrieves system environment info for reproducibility tracking.
+    
+    Returns:
+        A dictionary containing Python version, OS info, and library paths.
     """
-    if not metrics_list:
-        return ""
-
-    headers = ["System", "EM", "F1", "Halluc. Rate", "Correction Rate"]
-    rows = []
-    for name, m in metrics_list:
-        rows.append([
-            name,
-            f"{m.get('em', 0):.3f}",
-            f"{m.get('f1', 0):.3f}",
-            f"{m.get('hallucination_rate', 0):.3f}",
-            f"{m.get('correction_rate', 0):.3f}",
-        ])
-
-    col_widths = [max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
-    sep = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
-    header_row = "| " + " | ".join(h.ljust(w) for h, w in zip(headers, col_widths)) + " |"
-
-    lines = [sep, header_row, sep]
-    for row in rows:
-        lines.append("| " + " | ".join(v.ljust(w) for v, w in zip(row, col_widths)) + " |")
-    lines.append(sep)
-
-    return "\n".join(lines)
+    info = {
+        "python_version": sys.version.replace('\n', ' '),
+        "os_platform": platform.platform(),
+        "os_release": platform.release()
+    }
+    return info

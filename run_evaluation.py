@@ -15,7 +15,7 @@ import json
 import os
 from pipeline import SelfHealingRAGPipeline
 from evaluation.evaluator import Evaluator
-from utils.helpers import format_results_table
+from evaluation.metrics import format_results_table
 
 
 def parse_args():

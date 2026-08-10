@@ -1,8 +1,6 @@
 # Design and Evaluation of a Self-Healing Agentic RAG System
 ### for Robust Multi-Turn Task Execution
 
-**Team:** Samrudha Narendra (PES1UG23CS506) · K Shaman (PES1UG23CS272) · ISL Nandini (PES1UG23CS252)
-
 ---
 
 ## 1. Introduction
