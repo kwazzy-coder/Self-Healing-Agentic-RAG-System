@@ -1,7 +1,5 @@
 # Self-Healing Agentic RAG System
 
-**Team:** Samrudha Narendra (PES1UG23CS506) · K Shaman (PES1UG23CS272) · ISL Nandini (PES1UG23CS252)
-
 A fully implemented **Self-Healing Agentic Retrieval-Augmented Generation (RAG)** system that autonomously detects failures in its own reasoning pipeline and corrects them before returning a final answer. Evaluated on **HotpotQA** (multi-hop reasoning) and **RAGBench** (faithfulness/grounding scoring).
 
 ---
