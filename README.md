@@ -1,9 +1,6 @@
 # Self-Healing Agentic RAG
 
-[![CI](https://github.com/kwazzy-coder/Self-Healing-Agentic-RAG-System/actions/workflows/ci.yml/badge.svg)](https://github.com/kwazzy-coder/Self-Healing-Agentic-RAG-System/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue)
-![FastAPI](https://img.shields.io/badge/API-FastAPI-009688)
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kwazzy-coder/Self-Healing-Agentic-RAG-System/blob/master/notebooks/reproduce_results.ipynb)
+
 
 A retrieval-augmented QA system that **checks its own answers for hallucinations and repairs them
 before replying**, while keeping the extra LLM cost low.
