@@ -1,13 +1,14 @@
 """
-experiments/runner.py — Unified Experiment Runner
+experiments/runner.py — Run one YAML-defined experiment over one or more seeds.
 
-Runs experiments defined by YAML config files with:
-- Multi-seed execution for statistical robustness
-- Structured result saving (JSON + CSV)
-- Runtime metadata logging (hardware, software, timestamps)
-- Confidence interval computation
-- Comparison table generation across configs
+    python -m experiments.runner --config experiments/configs/full_system.yaml
+    python -m experiments.runner --config experiments/configs/ablation_no_nli.yaml --dry_run
+
+All experiments on the same dataset/size/seed share one results directory, so
+the reference vanilla_rag run is computed once (with default settings) and
+reused by every ablation.
 """
+from __future__ import annotations
 
 import argparse
 import json
@@ -15,224 +16,149 @@ import logging
 import os
 import platform
 import random
-import time
-from datetime import datetime
-from typing import Dict, Any, List
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterator, List
 
 import numpy as np
 
-# Assuming we have evaluation components and pipeline accessible.
-# If not, these would be placeholders.
+import config
 from experiments.config_schema import ExperimentConfig
 
 logger = logging.getLogger(__name__)
 
-def set_seeds(seed: int):
-    """Set random seeds for reproducibility."""
+
+def set_seeds(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     try:
         import torch
+
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
     except ImportError:
         pass
+
+
+@contextmanager
+def config_overrides(overrides: Dict[str, Any]) -> Iterator[None]:
+    """Temporarily set config.py attributes (modules read config.X at call time, so this works)."""
+    old = {k: getattr(config, k) for k in overrides if hasattr(config, k)}
+    unknown = [k for k in overrides if not hasattr(config, k)]
+    if unknown:
+        raise KeyError(f"Unknown config keys: {unknown}")
+    for k, v in overrides.items():
+        setattr(config, k, v)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            setattr(config, k, v)
+
 
 def get_system_metadata() -> Dict[str, Any]:
-    """Collect runtime metadata."""
     return {
-        "os": platform.system(),
-        "os_release": platform.release(),
-        "python_version": platform.python_version(),
+        "python": platform.python_version(),
+        "os": f"{platform.system()} {platform.release()}",
         "machine": platform.machine(),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
-def apply_config_overrides(config: ExperimentConfig):
-    """
-    Dynamically patch the system configuration based on the experiment config.
-    This modifies global config singletons or sets env vars.
-    """
-    import config as system_config
-    
-    # LLM Config
-    system_config.LLM_BACKEND = config.llm.backend
-    if config.llm.model_name:
-        if config.llm.backend == "gemini":
-            system_config.GEMINI_MODEL = config.llm.model_name
-        elif config.llm.backend == "groq":
-            system_config.GROQ_MODEL = config.llm.model_name
-        elif config.llm.backend == "ollama":
-            system_config.OLLAMA_MODEL = config.llm.model_name
-        elif config.llm.backend == "openai":
-            system_config.OPENAI_MODEL = config.llm.model_name
-        elif config.llm.backend == "huggingface":
-            system_config.HF_MODEL = config.llm.model_name
-            
-    if hasattr(config.llm, "temperature"):
-        system_config.TEMPERATURE = config.llm.temperature
-    if hasattr(config.llm, "max_answer_words"):
-        system_config.MAX_ANSWER_WORDS = config.llm.max_answer_words
-    if hasattr(config.llm, "context_char_limit"):
-        system_config.CONTEXT_CHAR_LIMIT = config.llm.context_char_limit
 
-    # Retrieval Config
-    if hasattr(config.retrieval, "embedding_model"):
-        system_config.EMBEDDING_MODEL = config.retrieval.embedding_model
-    if hasattr(config.retrieval, "top_k"):
-        system_config.TOP_K_RETRIEVAL = config.retrieval.top_k
-    if hasattr(config.retrieval, "bm25_weight"):
-        system_config.BM25_WEIGHT = config.retrieval.bm25_weight
-    if hasattr(config.retrieval, "dense_weight"):
-        system_config.DENSE_WEIGHT = config.retrieval.dense_weight
-    if hasattr(config.retrieval, "fusion_method"):
-        system_config.RETRIEVAL_FUSION_METHOD = config.retrieval.fusion_method
+def pipeline_config_for(exp: ExperimentConfig):
+    from pipeline import PipelineConfig
 
-    # Healing Config
-    if hasattr(config.healing, "max_correction_attempts"):
-        system_config.MAX_CORRECTION_ATTEMPTS = config.healing.max_correction_attempts
-    if hasattr(config.healing, "confidence_threshold"):
-        system_config.CONFIDENCE_THRESHOLD = config.healing.confidence_threshold
-        
-    if getattr(config.healing, "decompose_questions", False):
-        # We handle decompose_questions by patching the TaskPlanner behavior in run_evaluation
-        pass
+    r, h = exp.retrieval, exp.healing
+    return PipelineConfig(
+        name=exp.name,
+        top_k=r.top_k,
+        fusion_method=r.fusion_method,
+        max_correction_rounds=h.max_correction_attempts,
+        enable_healing=h.enabled,
+        enable_planning=r.enabled,
+        monitor_mode=h.monitor_mode,
+        always_correct=h.always_correct,
+        use_retrieval=r.enabled,
+    )
 
-def run_evaluation(config: ExperimentConfig, seed: int) -> Dict[str, Any]:
-    """
-    Run the evaluation pipeline for a single seed.
-    """
-    from pipeline import SelfHealingRAGPipeline
-    from evaluation.evaluator import Evaluator
-    
-    # Load dataset
-    if config.dataset.name == "hotpotqa":
+
+def load_dataset_samples(exp: ExperimentConfig, seed: int) -> List[Dict[str, Any]]:
+    d = exp.dataset
+    if d.name == "hotpotqa":
         from data.hotpotqa_loader import load_hotpotqa
-        setting = getattr(config.dataset, "subset", "distractor")
-        samples = load_hotpotqa(n_samples=config.dataset.n_samples, setting=setting)
-    elif config.dataset.name == "ragbench":
-        from data.ragbench_loader import load_ragbench
-        subset = getattr(config.dataset, "subset", "covidqa")
-        split = getattr(config.dataset, "split", "test")
-        samples = load_ragbench(subset=subset, split=split, n_samples=config.dataset.n_samples)
-    else:
-        raise ValueError(f"Unknown dataset: {config.dataset.name}")
-        
-    pipeline = SelfHealingRAGPipeline()
-    evaluator = Evaluator(pipeline)
-    
-    healing_enabled = getattr(config.healing, "enabled", True)
-    decompose_questions = getattr(config.healing, "decompose_questions", True)
-    
-    # Temporarily patch TaskPlanner behavior if decompose_questions is disabled
-    import agent.task_planner as tp
-    original_plan = tp.TaskPlanner.plan
-    if not decompose_questions:
-        tp.TaskPlanner.plan = lambda self, q: [q]
-        
-    try:
-        if not healing_enabled:
-            # Run baseline path when healing is disabled
-            pipeline.run = pipeline.run_baseline
-            
-        if config.dataset.name == "hotpotqa":
-            results = evaluator.evaluate_hotpotqa(samples, compare_baseline=not healing_enabled)
-        else:
-            results = evaluator.evaluate_ragbench(samples, subset=getattr(config.dataset, "subset", "covidqa"))
-            
-    finally:
-        # Restore TaskPlanner behavior
-        tp.TaskPlanner.plan = original_plan
-        
-    return results
 
-def compute_confidence_intervals(results_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
-    """
-    Compute mean and confidence intervals across seeds using evaluation.statistical.
-    """
-    try:
-        from evaluation.statistical import bootstrap_confidence_interval
-        aggregated = {}
-        if not results_list: return aggregated
-        metrics = results_list[0].keys()
-        for metric in metrics:
-            values = [res[metric] for res in results_list if metric in res]
-            if not values:
-                continue
-            mean_val = np.mean(values)
-            ci_lower, ci_upper = bootstrap_confidence_interval(values)
-            aggregated[metric] = {
-                "mean": mean_val,
-                "ci_lower": ci_lower,
-                "ci_upper": ci_upper
-            }
-        return aggregated
-    except ImportError:
-        logger.warning("Could not import evaluation.statistical. Using simple stats.")
-        aggregated = {}
-        if not results_list: return aggregated
-        metrics = results_list[0].keys()
-        for metric in metrics:
-            values = [res.get(metric, 0.0) for res in results_list]
-            aggregated[metric] = {
-                "mean": float(np.mean(values)),
-                "std": float(np.std(values)),
-                "ci_lower": float(np.mean(values) - 1.96 * np.std(values) / np.sqrt(len(values))),
-                "ci_upper": float(np.mean(values) + 1.96 * np.std(values) / np.sqrt(len(values)))
-            }
-        return aggregated
+        return load_hotpotqa(d.n_samples, seed=seed, question_type=d.question_type)
+    if d.name == "musique":
+        from data.musique_loader import load_musique
 
-def run_experiment(config_path: str, output_dir: str = "results", dry_run: bool = False):
-    """Run an experiment defined by a YAML configuration."""
-    config = ExperimentConfig.from_yaml(config_path)
-    logger.info(f"Loaded config: {config.name}")
-    
+        return load_musique(d.n_samples, seed=seed)
+    raise ValueError(f"Unsupported dataset for QA experiments: {d.name}")
+
+
+def run_experiment(config_path: str, output_dir: str = "results/experiments", dry_run: bool = False,
+                   components: Any = None, samples_override: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    exp = ExperimentConfig.from_yaml(config_path)
+    logger.info("Experiment '%s': %s", exp.name, exp.description)
     if dry_run:
-        logger.info("Dry run enabled. Validated config and exiting.")
-        return
-        
-    apply_config_overrides(config)
-    os.makedirs(output_dir, exist_ok=True)
-    
-    seed_results = []
-    start_time = time.time()
-    
-    for seed in config.seeds:
-        logger.info(f"Running evaluation with seed {seed}")
+        logger.info("Config OK. Overrides: %s | pipeline: %s", exp.config_overrides(), pipeline_config_for(exp))
+        return {"experiment_name": exp.name, "dry_run": True}
+
+    from agent.llm_reasoner import LLMReasoner
+    from baselines import build_system
+    from evaluation.evaluator import Evaluator
+    from pipeline import Components, SelfHealingRAGPipeline
+
+    if components is None:
+        with config_overrides({"LLM_MODEL": exp.llm.model_name} if exp.llm.model_name else {}):
+            components = Components.build(llm=LLMReasoner(exp.llm.backend))
+    evaluator = Evaluator(results_dir=output_dir)
+    per_seed = []
+    for seed in exp.seeds:
         set_seeds(seed)
-        res = run_evaluation(config, seed)
-        seed_results.append({"seed": seed, "metrics": res})
-        
-    end_time = time.time()
-    
-    # Aggregate results
-    metrics_list = [sr["metrics"] for sr in seed_results]
-    aggregated = compute_confidence_intervals(metrics_list)
-    
-    final_report = {
-        "experiment_name": config.name,
-        "description": config.description,
+        samples = samples_override or load_dataset_samples(exp, seed)
+        tag = f"{exp.dataset.name}{'-' + exp.dataset.question_type if exp.dataset.question_type else ''}" \
+              f"_n{exp.dataset.n_samples}/seed{seed}"
+        if exp.compare_baseline:  # reference run with default settings, shared by all experiments
+            evaluator.evaluate_qa({"vanilla_rag": build_system("vanilla_rag", components)}, samples, tag,
+                                  summary_name="summary_vanilla_rag")
+        with config_overrides(exp.config_overrides()):
+            systems = {exp.name: SelfHealingRAGPipeline(pipeline_config_for(exp), components=components)}
+            if exp.compare_baseline:
+                systems = {"vanilla_rag": build_system("vanilla_rag", components), **systems}
+            summary = evaluator.evaluate_qa(systems, samples, tag, summary_name=f"summary_{exp.name}",
+                                            meta={"experiment": exp.name, "seed": seed})
+        per_seed.append({"seed": seed, "summary": summary})
+
+    from evaluation.statistical import aggregate_across_seeds
+
+    agg = {}
+    for system in per_seed[0]["summary"]["systems"]:
+        agg[system] = aggregate_across_seeds([s["summary"]["systems"][system] for s in per_seed])
+    report = {
+        "experiment_name": exp.name,
+        "description": exp.description,
+        "config": exp.model_dump(),
         "metadata": get_system_metadata(),
-        "execution_time_seconds": end_time - start_time,
-        "seed_results": seed_results,
-        "aggregated_metrics": aggregated
+        "seeds": exp.seeds,
+        "aggregate": agg,
+        "comparisons_by_seed": {s["seed"]: s["summary"]["comparisons"] for s in per_seed},
     }
-    
-    out_file = os.path.join(output_dir, f"{config.name}_results.json")
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(final_report, f, indent=2)
-        
-    logger.info(f"Results saved to {out_file}")
-    return final_report
+    os.makedirs(output_dir, exist_ok=True)
+    out = os.path.join(output_dir, f"{exp.name}.json")
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
+    logger.info("Saved %s", out)
+    return report
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Run one experiment config")
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--out_dir", default="results/experiments")
+    ap.add_argument("--dry_run", action="store_true")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    run_experiment(args.config, args.out_dir, args.dry_run)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run RAG experiments")
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
-    parser.add_argument("--out_dir", type=str, default="results", help="Output directory")
-    parser.add_argument("--dry_run", action="store_true", help="Validate config without running")
-    
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    args = parser.parse_args()
-    
-    run_experiment(args.config, args.out_dir, args.dry_run)
+    main()

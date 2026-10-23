@@ -1,141 +1,98 @@
 """
-analysis/error_analysis.py — Failure Categorization & Error Analysis
+analysis/error_analysis.py — Where does the system fail, and what does healing change?
 
-Categorizes and analyzes failures in the RAG pipeline to identify
-systematic patterns and areas for improvement.
+    python -m analysis.error_analysis results/hotpotqa_n200_s42/self_healing.jsonl
+
+Categories (short-answer QA):
+  correct          EM = 1
+  partial          EM = 0 but token F1 > 0 (right idea, wrong span/format)
+  retrieval_miss   a gold supporting passage never reached the generator
+  reasoning_error  all gold passages were in context, answer still wrong
+
+Healing transitions compare the initial answer with the final one:
+  fixed (wrong -> right), broken (right -> wrong), kept_right, kept_wrong.
 """
+from __future__ import annotations
 
+import argparse
 import json
-import os
-from typing import List, Dict, Any
+from collections import Counter, defaultdict
+from typing import Any, Dict, List
 
-class ErrorAnalyzer:
-    """Analyzes and categorizes failures in the RAG pipeline."""
-    
-    def __init__(self):
-        """Initializes the ErrorAnalyzer."""
-        pass
 
-    def categorize_failures(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Categorize each failure.
-        
-        Categories: retrieval_failure, generation_hallucination, 
-        query_ambiguity, incomplete_answer.
-        
-        Args:
-            results: List of result dictionaries.
-            
-        Returns:
-            Dictionary with categorized failures.
-        """
-        categorized = {
-            "retrieval_failure": [],
-            "generation_hallucination": [],
-            "query_ambiguity": [],
-            "incomplete_answer": [],
-            "other": []
-        }
-        
-        for res in results:
-            if not res.get("is_correct", True):
-                # Dummy categorization logic based on assumed fields
-                error_type = res.get("error_type", "other")
-                if error_type in categorized:
-                    categorized[error_type].append(res)
-                else:
-                    categorized["other"].append(res)
-                    
-        return categorized
+def categorize(rec: Dict[str, Any]) -> str:
+    if rec.get("em", 0) >= 1:
+        return "correct"
+    if rec.get("f1", 0) > 0:
+        return "partial"
+    if rec.get("support_recall", 1.0) < 1.0:
+        return "retrieval_miss"
+    return "reasoning_error"
 
-    def compute_failure_statistics(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Compute per-category counts and percentages.
-        
-        Args:
-            results: List of result dictionaries.
-            
-        Returns:
-            Dictionary with failure statistics.
-        """
-        categorized = self.categorize_failures(results)
-        total_failures = sum(len(cases) for cases in categorized.values())
-        
-        stats = {}
-        for category, cases in categorized.items():
-            count = len(cases)
-            stats[category] = {
-                "count": count,
-                "percentage": (count / total_failures * 100) if total_failures > 0 else 0
-            }
-            
-        return stats
 
-    def identify_healing_patterns(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Identify when self-healing helps vs hurts.
-        
-        Args:
-            results: List of result dictionaries.
-            
-        Returns:
-            Dictionary grouping outcomes by question type and failure type.
-        """
-        patterns = {
-            "helped": [],
-            "hurt": [],
-            "no_change": []
-        }
-        
-        # Stub implementation
-        return patterns
+def transition(rec: Dict[str, Any]) -> str:
+    before, after = rec.get("initial_em", 0) >= 1, rec.get("em", 0) >= 1
+    if before and after:
+        return "kept_right"
+    if not before and after:
+        return "fixed"
+    if before and not after:
+        return "broken"
+    return "kept_wrong"
 
-    def get_failure_examples(self, results: List[Dict[str, Any]], n: int = 5) -> List[Dict[str, Any]]:
-        """
-        Get representative failure cases.
-        
-        Args:
-            results: List of result dictionaries.
-            n: Number of examples to return.
-            
-        Returns:
-            List of failure examples.
-        """
-        failures = [r for r in results if not r.get("is_correct", True)]
-        return failures[:n]
 
-    def get_success_examples(self, results: List[Dict[str, Any]], n: int = 5) -> List[Dict[str, Any]]:
-        """
-        Get representative success cases where healing helped.
-        
-        Args:
-            results: List of result dictionaries.
-            n: Number of examples to return.
-            
-        Returns:
-            List of success examples.
-        """
-        # Stub: assuming 'healing_helped' is a boolean flag in results
-        successes = [r for r in results if r.get("healing_helped", False)]
-        return successes[:n]
+def analyze(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ok = [r for r in records if not r.get("error")]
+    n = max(1, len(ok))
+    cats = Counter(categorize(r) for r in ok)
+    trans = Counter(transition(r) for r in ok)
+    by_failure: Dict[str, Counter] = defaultdict(Counter)
+    by_strategy: Dict[str, Counter] = defaultdict(Counter)
+    for r in ok:
+        if r.get("failure_detected"):
+            by_failure[r.get("failure_type") or "?"][transition(r)] += 1
+            rounds = r.get("rounds", [])
+            sel = r.get("selected_round", 0)
+            strategy = rounds[sel]["produced_by"] if sel < len(rounds) else "initial"
+            by_strategy[strategy][transition(r)] += 1
+    return {
+        "n": len(ok),
+        "categories": {k: {"count": v, "pct": v / n} for k, v in cats.most_common()},
+        "transitions": dict(trans),
+        "by_failure_type": {k: dict(v) for k, v in by_failure.items()},
+        "by_selected_strategy": {k: dict(v) for k, v in by_strategy.items()},
+    }
 
-    def generate_error_report(self, results: List[Dict[str, Any]], output_path: str):
-        """
-        Generate comprehensive markdown error analysis report.
-        
-        Args:
-            results: List of result dictionaries.
-            output_path: Path to write the markdown report.
-        """
-        stats = self.compute_failure_statistics(results)
-        
-        lines = [
-            "# Error Analysis Report\n",
-            "## Failure Statistics\n"
-        ]
-        
-        for category, stat in stats.items():
-            lines.append(f"- **{category}**: {stat['count']} cases ({stat['percentage']:.1f}%)\n")
-            
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
+
+def case_studies(records: List[Dict[str, Any]], kind: str = "fixed", n: int = 3) -> str:
+    """Markdown write-ups of a few healing successes (kind='fixed') or failures ('broken')."""
+    picks = [r for r in records if not r.get("error") and transition(r) == kind][:n]
+    out = []
+    for r in picks:
+        out.append(f"#### {r['question']}\n")
+        out.append(f"- Gold: **{r['gold']}**")
+        for rd in r.get("rounds", []):
+            verdict = "" if rd.get("has_failure") is None else (
+                f" — monitor: {'FAIL ' + rd.get('failure_type', '') if rd['has_failure'] else 'PASS'}"
+                f" (tier {rd.get('monitor_tier')}, conf {rd.get('confidence')})")
+            out.append(f"- Round {rd['round']} [{rd['produced_by']}]: `{rd['answer']}`{verdict}")
+        out.append(f"- Final: `{r['answer']}`\n")
+    return "\n".join(out) if out else f"_No '{kind}' cases._"
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("jsonl", help="per-sample results file, e.g. results/<tag>/self_healing.jsonl")
+    ap.add_argument("--cases", type=int, default=3)
+    args = ap.parse_args()
+    with open(args.jsonl, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+    print(json.dumps(analyze(records), indent=2))
+    print("\n### Healing successes\n")
+    print(case_studies(records, "fixed", args.cases))
+    print("\n### Healing regressions\n")
+    print(case_studies(records, "broken", args.cases))
+
+
+if __name__ == "__main__":
+    main()

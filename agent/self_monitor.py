@@ -1,252 +1,285 @@
 """
-agent/self_monitor.py — Multi-Tiered Self-Monitoring Module
+agent/self_monitor.py — Three-tier cascading failure detector.
 
-Core novelty: 3-tier cascading failure detection.
-  Tier 1: Zero-cost heuristics (empty/refusal, keyword overlap) — <1ms, 0 API calls
-  Tier 2: Lightweight NLI entailment (67M param cross-encoder) — ~50ms, 0 API calls
-  Tier 3: LLM-as-judge (full semantic check) — ~2-4s, 1 API call
+  Tier 1  Heuristics      ~0 ms, free   empty / refusal / answer-type mismatch / off-topic
+  Tier 2  NLI grounding   ~50 ms, free  cross-encoder P(entailment) of the answer given the passages
+  Tier 3  LLM judge       1 API call    only when Tier 2 is uncertain (NLI_LOW <= p <= NLI_HIGH)
 
-Key insight: ~70% of queries are resolved at Tier 1-2, saving significant API cost.
-Tier 3 only fires when NLI score is in the uncertain range [τ_low, τ_high].
+Cheap tiers resolve the clear-cut cases, so the expensive LLM judge only runs
+on the ambiguous ones. Each tier can be switched off for ablations
+(``MonitorSettings``), which is how the "LLM-judge-only" and "NLI-only"
+baselines are produced.
 """
-import re
+from __future__ import annotations
+
 import logging
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Any
+import re
+from dataclasses import asdict, dataclass, field
+from typing import Any, List, Optional
+
 import config
-from config import LLM_BACKEND
+from agent.cost_tracker import CURRENT_TRACKER
+from agent.nli import NLIScorer, answer_to_hypotheses, build_premises
 
 logger = logging.getLogger(__name__)
 
-# NLI thresholds for Tier 2 → Tier 3 escalation
-NLI_CONTRADICTION_THRESHOLD = 0.3  # Below this = definitely ungrounded
-NLI_ENTAILMENT_THRESHOLD = 0.7     # Above this = definitely grounded
-# Between 0.3 and 0.7 = uncertain → escalate to Tier 3
-
 UNCERTAINTY_PHRASES = [
-    "i don't know", "i do not know", "cannot be determined",
-    "not mentioned", "not provided", "no information",
-    "i'm not sure", "not specified", "not available",
-    "not enough information", "cannot answer", "cannot find",
-    "the context does not", "there is no information",
-    "based on the context, i cannot",
+    "i don't know", "i do not know", "cannot be determined", "can't be determined",
+    "not mentioned", "not provided", "no information", "i'm not sure", "not specified",
+    "not enough information", "cannot answer", "can't answer", "cannot find",
+    "the context does not", "the passages do not", "there is no information",
+    "based on the context, i cannot", "unable to determine",
 ]
+_QUESTION_STOPWORDS = {
+    "what", "who", "where", "when", "which", "how", "is", "are", "was", "were", "the",
+    "a", "an", "does", "did", "do", "of", "in", "on", "for", "to", "and", "or", "by",
+    "with", "that", "this", "from", "at", "as", "be", "has", "have", "had",
+}
+_AUX_START = re.compile(r"^(is|are|was|were|do|does|did|can|could|has|have|had|will|would|should)\b", re.I)
 
-@dataclass 
+# Failure type -> recommended corrective strategy (consumed by CorrectiveActions)
+FAILURE_STRATEGY_MAP = {
+    "empty": "expand_retrieve",
+    "refusal": "reformulate",
+    "type_mismatch": "decompose",
+    "irrelevant": "re_retrieve",
+    "ungrounded": "re_retrieve",
+    "hallucinated": "expand_retrieve",
+    "inconsistent": "adopt_last_hop",
+}
+
+
+@dataclass
+class MonitorSettings:
+    use_heuristics: bool = True
+    use_nli: bool = True
+    use_llm_judge: bool = True
+    short_answers: bool = True  # enables the yes/no answer-type check
+
+    @classmethod
+    def from_mode(cls, mode: str, short_answers: bool = True) -> MonitorSettings:
+        modes = {
+            "tiered": (True, True, True),
+            "heuristic": (True, False, False),
+            "nli": (False, True, False),
+            "heuristic_nli": (True, True, False),
+            "heuristic_llm": (True, False, True),
+            "llm": (False, False, True),
+        }
+        if mode not in modes:
+            raise ValueError(f"Unknown monitor mode '{mode}'. Choose from {sorted(modes)}")
+        h, n, j = modes[mode]
+        return cls(use_heuristics=h, use_nli=n, use_llm_judge=j, short_answers=short_answers)
+
+
+@dataclass
 class FailureReport:
-    """Report generated after evaluating an answer."""
+    """Verdict of the monitor for one (question, answer, passages) triple."""
+
     has_failure: bool = False
-    confidence_ok: bool = True
-    grounding_ok: bool = True
-    completeness_ok: bool = True
-    llm_verify_ok: bool = True
-    consistency_ok: bool = True
-    low_confidence: bool = False
-    confidence_score: float = 1.0
-    ungrounded_sentences: List[str] = field(default_factory=list)
+    failure_type: str = ""
     failure_reason: str = ""
     suggested_action: str = ""
-    monitor_tier_used: int = 0  # which tier caught the failure (0=pass, 1, 2, 3)
-    failure_type: str = ""  # categorized failure type for adaptive correction
+    monitor_tier_used: int = 0          # 0 = no check ran, 1/2/3 = deciding tier
+    confidence_score: float = 0.5       # ordinal grounding confidence in [0, 1]
+    nli_entailment: Optional[float] = None
+    nli_contradiction: Optional[float] = None
+    judge_verdict: Optional[bool] = None
+    ungrounded_sentences: List[str] = field(default_factory=list)
+    llm_calls: int = 0
+
+    # Backwards-compatible flags used by older code / reports
+    @property
+    def grounding_ok(self) -> bool:
+        return self.failure_type not in ("ungrounded", "hallucinated", "irrelevant")
+
+    @property
+    def confidence_ok(self) -> bool:
+        return self.failure_type != "refusal"
+
+    @property
+    def completeness_ok(self) -> bool:
+        return self.failure_type != "empty"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _norm(text: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", (text or "").lower()).replace(" the ", " ").split())
+
+
+def is_refusal(answer: str) -> Optional[str]:
+    a = (answer or "").lower()
+    return next((p for p in UNCERTAINTY_PHRASES if p in a), None)
+
+
+def expects_yes_no(question: str) -> Optional[bool]:
+    """True: yes/no question; False: 'A or B' choice question; None: open question."""
+    q = question.strip().lower()
+    if " or " in q:
+        return False
+    if _AUX_START.match(q):
+        return True
+    return None
+
 
 class SelfMonitor:
-    """Evaluates agent responses using explicit multi-tiered cascading checks."""
+    """Evaluates an answer with the cascading Tier 1 -> 2 -> 3 checks."""
 
-    def __init__(self, llm: Any, cost_tracker: Any = None) -> None:
-        """
-        Initialize the SelfMonitor.
-        
-        Args:
-            llm: The LLM reasoner instance.
-            cost_tracker: Optional tracker for monitoring API and model usage.
-        """
+    def __init__(
+        self,
+        llm: Any,
+        nli: Optional[NLIScorer] = None,
+        settings: Optional[MonitorSettings] = None,
+        cost_tracker: Any = None,
+    ) -> None:
         self.llm = llm
-        self._nli_pipeline = None
-        self.cost_tracker = cost_tracker  # for tracking
-    
-    def evaluate(self, question: str, answer: str, retrieved_docs: List[str], sub_answers: Optional[List[str]] = None) -> FailureReport:
-        """
-        Evaluate an answer through a 3-tier failure detection pipeline.
-        
-        Args:
-            question: The user query.
-            answer: The generated answer.
-            retrieved_docs: The context retrieved.
-            sub_answers: Any sub-answers if decomposition was used.
-            
-        Returns:
-            A FailureReport object containing evaluation results.
-        """
-        report = FailureReport()
-        
-        # ═══ TIER 1: Zero-cost heuristics ═══
-        tier1_result = self._tier1_heuristics(answer, question)
-        if tier1_result is not None:
-            report = tier1_result
-            report.monitor_tier_used = 1
-            if self.cost_tracker:
-                self.cost_tracker.record_monitor_tier(1)
-            logger.info("Tier 1 caught failure: %s", report.failure_type)
-            return report
-        
-        # ═══ TIER 2: NLI grounding check ═══
-        nli_score = self._tier2_nli_check(answer, retrieved_docs)
-        if self.cost_tracker:
-            self.cost_tracker.record_nli_inference()
-        
-        if nli_score < NLI_CONTRADICTION_THRESHOLD:
-            # Definitely ungrounded
-            report.has_failure = True
-            report.grounding_ok = False
-            report.confidence_score = nli_score
-            report.ungrounded_sentences = [answer]
-            report.failure_reason = f"NLI contradiction (score={nli_score:.2f})"
-            report.suggested_action = "re_retrieve"
-            report.monitor_tier_used = 2
-            report.failure_type = "ungrounded"
-            if self.cost_tracker:
-                self.cost_tracker.record_monitor_tier(2)
-            logger.info("Tier 2 caught failure: %s", report.failure_type)
-            return report
-        
-        if nli_score > NLI_ENTAILMENT_THRESHOLD:
-            # Definitely grounded — PASS at Tier 2
-            report.monitor_tier_used = 2
-            report.confidence_score = nli_score
-            if self.cost_tracker:
-                self.cost_tracker.record_monitor_tier(2)
-            # Still check consistency if sub_answers exist
-            if sub_answers and len(sub_answers) >= 2:
-                if not self._check_consistency(sub_answers):
-                    report.has_failure = True
-                    report.consistency_ok = False
-                    report.failure_reason = "sub-answer contradiction"
-                    report.suggested_action = "decompose"
-                    report.failure_type = "inconsistent"
-            return report
-        
-        # NLI score in uncertain range — escalate to Tier 3
-        # ═══ TIER 3: LLM-as-judge ═══
-        if LLM_BACKEND in ("gemini", "groq", "openai", "ollama"):
-            llm_ok = self._tier3_llm_judge(question, answer, retrieved_docs)
-            if self.cost_tracker:
-                self.cost_tracker.record_llm_call()
-                self.cost_tracker.record_monitor_tier(3)
-            report.monitor_tier_used = 3
-            
-            if not llm_ok:
-                report.has_failure = True
-                report.llm_verify_ok = False
-                report.confidence_score = nli_score
-                report.failure_reason = f"LLM judge rejected (NLI was uncertain: {nli_score:.2f})"
-                report.suggested_action = "re_retrieve"
-                report.failure_type = "hallucinated"
-                logger.info("Tier 3 caught failure: %s", report.failure_type)
-                return report
-        
-        # All checks passed
-        return report
-    
-    def _tier1_heuristics(self, answer: str, question: str) -> Optional[FailureReport]:
-        """Tier 1: Zero-cost checks. Returns FailureReport if failure, None if pass."""
-        report = FailureReport()
-        a = answer.lower().strip().rstrip(".")
-        
-        # Check 1a: Empty/garbage
-        if not a or a in (".", ",", "?", "-", "n/a", "none"):
-            report.has_failure = True
-            report.completeness_ok = False
-            report.confidence_score = 0.0
-            report.failure_reason = "empty/missing answer"
-            report.suggested_action = "expand_retrieve"
-            report.failure_type = "empty"
-            return report
-        
-        # Check 1b: Uncertainty phrases  
-        for phrase in UNCERTAINTY_PHRASES:
-            if phrase in a:
-                report.has_failure = True
-                report.confidence_ok = False
-                report.low_confidence = True
-                report.confidence_score = 0.0
-                report.failure_reason = f"uncertain answer: '{phrase}'"
-                report.suggested_action = "reformulate"
-                report.failure_type = "refusal"
-                return report
-        
-        # Check 1c: Answer-question keyword overlap
-        q_words = set(question.lower().split()) - {'what', 'who', 'where', 'when', 'which', 'how', 'is', 'are', 'was', 'were', 'the', 'a', 'an', 'does', 'did', 'do'}
-        a_words = set(a.split())
-        # If there's ZERO overlap between meaningful question words and answer
-        # AND the answer is not a simple yes/no, something might be wrong
-        # But be conservative — only flag if answer is long and has zero overlap
-        if len(a.split()) > 5 and len(q_words) > 3:
-            overlap = q_words & a_words
-            if len(overlap) == 0:
-                report.has_failure = True
-                report.grounding_ok = False
-                report.confidence_score = 0.2
-                report.failure_reason = "answer has no keyword overlap with question"
-                report.suggested_action = "re_retrieve"
-                report.failure_type = "irrelevant"
-                return report
-        
-        return None  # Pass Tier 1
-    
-    def _tier2_nli_check(self, answer: str, retrieved_docs: List[str]) -> float:
-        """Tier 2: NLI entailment score. Returns float 0-1."""
-        if not retrieved_docs or len(answer.split()) <= 2:
-            return 0.8  # Short answers get benefit of doubt
-        
-        combined = " ".join(retrieved_docs)[:2000]
-        nli = self._get_nli_pipeline()
-        
-        try:
-            result = nli(f"{combined}</s></s>{answer}")  # Use proper separator
-            # Cross-encoder returns labels like 'ENTAILMENT', 'CONTRADICTION', 'NEUTRAL'
-            # Map to a score
-            if isinstance(result, list):
-                result = result[0]
-            label = result.get('label', '').upper()
-            score = result.get('score', 0.5)
-            
-            if 'ENTAILMENT' in label:
-                return score  # High = good
-            elif 'CONTRADICTION' in label:
-                return 1.0 - score  # Contradiction confidence inverted
-            else:  # NEUTRAL
-                return 0.5
-        except Exception as e:
-            logger.warning("NLI check failed: %s. Defaulting to pass.", e)
-            return 0.8  # Fail open
-    
-    def _tier3_llm_judge(self, question: str, answer: str, retrieved_docs: List[str]) -> bool:
-        """Tier 3: LLM verification. Returns bool."""
-        context = " ".join(d[:200] for d in retrieved_docs[:3])
-        prompt = (
-            f"Question: {question}\n"
-            f"Answer: {answer}\n"
-            f"Context: {context}\n\n"
-            f"Is this answer fully supported by the context? Reply YES or NO only."
+        self.nli = nli or NLIScorer()
+        self.settings = settings or MonitorSettings(
+            use_nli=config.ENABLE_NLI, use_llm_judge=config.ENABLE_LLM_JUDGE
         )
+        self.cost_tracker = cost_tracker
+
+    # ── Public API ───────────────────────────────────────────────────────────
+    def evaluate(
+        self,
+        question: str,
+        answer: str,
+        retrieved_docs: List[str],
+        sub_answers: Optional[List[str]] = None,
+        strategy: Optional[str] = None,
+    ) -> FailureReport:
+        """
+        Args:
+            sub_answers: answers to the decomposed sub-questions, in order (if any).
+            strategy: the plan used ("sequential" enables the multi-hop consistency check).
+        """
+        s = self.settings
+
+        if s.use_heuristics:
+            report = self._tier1(question, answer)
+            if report is None and strategy == "sequential" and sub_answers:
+                report = self._consistency(answer, sub_answers[-1])
+            if report is not None:
+                return self._finish(report)
+
+        nli_score: Optional[float] = None
+        report = FailureReport()
+        if s.use_nli:
+            nli_score, contradiction, weakest = self._tier2(question, answer, retrieved_docs)
+            report.nli_entailment, report.nli_contradiction = nli_score, contradiction
+            report.monitor_tier_used = 2
+            report.confidence_score = nli_score
+            if nli_score >= config.NLI_HIGH:
+                return self._finish(report)
+            if nli_score < config.NLI_LOW or (contradiction >= 0.9 and nli_score < 0.5):
+                return self._finish(self._fail(
+                    report, "ungrounded", f"NLI: answer not entailed by passages (p={nli_score:.2f})",
+                    ungrounded=weakest,
+                ))
+
+        if s.use_llm_judge and self.llm is not None and getattr(self.llm, "is_api", False):
+            verdict, reason = self._tier3(question, answer, retrieved_docs)
+            report.monitor_tier_used = 3
+            report.judge_verdict = verdict
+            report.llm_calls += 1
+            base = nli_score if nli_score is not None else 0.5
+            if verdict is False:
+                report.confidence_score = min(base, 0.5) / 2
+                return self._finish(self._fail(report, "hallucinated", f"LLM judge: {reason}", ungrounded=[answer]))
+            if verdict is True:
+                report.confidence_score = max(base, 0.8)
+                return self._finish(report)
+            # Unparseable/failed verdict: fall through to the NLI-only decision below.
+
+        # No (usable) judge: resolve the uncertain NLI band at its midpoint.
+        if nli_score is not None and nli_score < (config.NLI_LOW + config.NLI_HIGH) / 2:
+            return self._finish(self._fail(report, "ungrounded", f"NLI uncertain-low (p={nli_score:.2f})",
+                                           ungrounded=[answer]))
+        if report.monitor_tier_used == 0:
+            report.monitor_tier_used = 1 if s.use_heuristics else 0
+        return self._finish(report)
+
+    # ── Tiers ────────────────────────────────────────────────────────────────
+    def _tier1(self, question: str, answer: str) -> Optional[FailureReport]:
+        report = FailureReport(monitor_tier_used=1, confidence_score=0.0)
+        a = (answer or "").strip().lower().rstrip(".")
+
+        if not a or a in {",", "?", "-", "n/a", "none", "null"}:
+            return self._fail(report, "empty", "empty/missing answer")
+
+        phrase = is_refusal(a)
+        if phrase:
+            return self._fail(report, "refusal", f"uncertain answer: '{phrase}'")
+
+        if self.settings.short_answers:
+            expected = expects_yes_no(question)
+            is_yn = a in ("yes", "no")
+            if expected is True and not is_yn and len(a.split()) <= 6:
+                return self._fail(report, "type_mismatch", "yes/no question answered with an entity")
+            if expected is False and is_yn:
+                return self._fail(report, "type_mismatch", "choice question ('A or B') answered yes/no")
+
+        q_words = {w.strip("?,.!\"'") for w in question.lower().split()} - _QUESTION_STOPWORDS
+        a_words = {w.strip("?,.!\"'") for w in a.split()}
+        if len(a.split()) > 12 and len(q_words) > 3 and not (q_words & a_words):
+            report.confidence_score = 0.2
+            return self._fail(report, "irrelevant", "long answer shares no keywords with the question")
+        return None
+
+    def _consistency(self, answer: str, last_hop: str) -> Optional[FailureReport]:
+        """Bridge questions: the final answer should agree with the answer of the last hop."""
+        if not last_hop or is_refusal(last_hop):
+            return None
+        a, b = _norm(answer), _norm(last_hop)
+        if not a or not b or a == b or a in b or b in a:
+            return None
+        report = FailureReport(monitor_tier_used=1, confidence_score=0.1)
+        return self._fail(report, "inconsistent", f"final answer '{answer}' contradicts last hop '{last_hop}'")
+
+    def _tier2(self, question: str, answer: str, docs: List[str]):
+        hypotheses = answer_to_hypotheses(question, answer)
+        premises = build_premises(docs, config.NLI_MAX_PREMISE_CHARS)
+        if not hypotheses or not premises:
+            return 0.0, 0.0, [answer]
         try:
-            response = self.llm.generate(prompt, max_tokens=5).strip().upper()
-            return not response.startswith("NO")
-        except Exception:
-            return True  # Fail open
+            scores = self.nli.score(premises, hypotheses)
+        except Exception as err:  # model download / runtime failure -> neutral
+            logger.warning("NLI check failed (%s); treating as uncertain.", err)
+            return 0.5, 0.0, []
+        tracker = self.cost_tracker or CURRENT_TRACKER.get()
+        if tracker:
+            tracker.record_nli_inference(len(premises) * len(hypotheses))
+        entail = min(s.entailment for s in scores)          # weakest sentence decides
+        contra = max(s.contradiction for s in scores)
+        weakest = [s.hypothesis for s in scores if s.entailment < config.NLI_LOW] or \
+                  [min(scores, key=lambda s: s.entailment).hypothesis]
+        return entail, contra, weakest
 
-    def _get_nli_pipeline(self) -> Any:
-        """Lazily load the NLI pipeline."""
-        if self._nli_pipeline is None:
-            from transformers import pipeline
-            model_name = getattr(config, 'NLI_MODEL', 'cross-encoder/nli-deberta-v3-small')
-            logger.info("Loading NLI model for grounding checks: %s", model_name)
-            self._nli_pipeline = pipeline("text-classification", model=model_name)
-        return self._nli_pipeline
+    def _tier3(self, question: str, answer: str, docs: List[str]):
+        try:
+            return self.llm.judge_support(question, answer, docs)
+        except Exception as err:
+            logger.warning("LLM judge failed (%s); treating as uncertain.", err)
+            return None, f"judge error: {err}"
 
-    def _check_consistency(self, sub_answers: List[str]) -> bool:
-        """Check if sub-answers contradict each other."""
-        lowers = [a.lower().strip().rstrip(".") for a in sub_answers]
-        has_yes = any(a == "yes" or a.startswith("yes,") for a in lowers)
-        has_no = any(a == "no" or a.startswith("no,") for a in lowers)
-        return not (has_yes and has_no)
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _fail(report: FailureReport, ftype: str, reason: str, ungrounded: Optional[List[str]] = None) -> FailureReport:
+        report.has_failure = True
+        report.failure_type = ftype
+        report.failure_reason = reason
+        report.suggested_action = FAILURE_STRATEGY_MAP.get(ftype, "re_retrieve")
+        if ungrounded:
+            report.ungrounded_sentences = list(ungrounded)
+        return report
+
+    def _finish(self, report: FailureReport) -> FailureReport:
+        tracker = self.cost_tracker or CURRENT_TRACKER.get()
+        if tracker:
+            tracker.record_monitor_tier(report.monitor_tier_used)
+        if report.has_failure:
+            logger.info("Monitor tier %d flagged '%s': %s", report.monitor_tier_used,
+                        report.failure_type, report.failure_reason)
+        return report

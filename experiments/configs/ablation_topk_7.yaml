@@ -1,0 +1,5 @@
+name: ablation_topk_7
+description: Retrieve 7 passages instead of 5.
+seeds: [42]
+dataset: {name: hotpotqa, n_samples: 100}
+retrieval: {top_k: 7}

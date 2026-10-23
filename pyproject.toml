@@ -1,0 +1,32 @@
+[project]
+name = "self-healing-agentic-rag"
+version = "2.0.0"
+description = "A RAG system that detects ungrounded answers (heuristics -> NLI -> LLM judge) and repairs them before replying."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+  "B008",   # FastAPI Depends() in defaults is idiomatic
+  "UP006", "UP007", "UP035", "UP045",  # keep typing.List/Optional for readability
+]
+
+[tool.ruff.lint.per-file-ignores]
+# prompt few-shots and demo passages are data: keep them on one line
+"agent/prompts.py" = ["E501"]
+"demo.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent", "analysis", "api", "baselines", "config", "data", "evaluation", "experiments",
+                     "pipeline", "retrieval", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning"]

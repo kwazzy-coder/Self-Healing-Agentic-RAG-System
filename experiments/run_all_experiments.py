@@ -1,104 +1,83 @@
 """
-experiments/run_all_experiments.py — Run All Ablation Experiments
+experiments/run_all_experiments.py — Run every YAML config and build one comparison table.
 
-Sequentially runs all experiment configurations and generates
-a comprehensive comparison report.
+    python -m experiments.run_all_experiments                 # run (skips finished ones)
+    python -m experiments.run_all_experiments --table_only    # just rebuild the table
 """
+from __future__ import annotations
 
 import argparse
 import glob
 import json
 import logging
 import os
-import time
-from typing import Dict, Any
-
-import pandas as pd
+from typing import List
 
 from experiments.runner import run_experiment
 
 logger = logging.getLogger(__name__)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-def generate_comparison_table(results_dir: str, output_file: str):
-    """Generates a CSV comparison table from all JSON results."""
-    result_files = glob.glob(os.path.join(results_dir, "*_results.json"))
-    data = []
-    
-    for fpath in result_files:
-        with open(fpath, "r", encoding="utf-8") as f:
-            res = json.load(f)
-            
-        row = {
-            "Experiment": res["experiment_name"],
-            "Description": res.get("description", "")
-        }
-        
-        # Flatten metrics
-        for metric, stats in res.get("aggregated_metrics", {}).items():
-            row[f"{metric}_mean"] = stats.get("mean", 0.0)
-            row[f"{metric}_ci_lower"] = stats.get("ci_lower", 0.0)
-            row[f"{metric}_ci_upper"] = stats.get("ci_upper", 0.0)
-            
-        data.append(row)
-        
-    if not data:
-        logger.warning("No results found to generate comparison table.")
-        return
-        
-    df = pd.DataFrame(data)
-    df.to_csv(output_file, index=False)
-    logger.info(f"Comparison table saved to {output_file}")
-    
-def run_all(configs_dir: str, results_dir: str, force: bool = False):
-    """Discovers and runs all YAML configs."""
+
+def comparison_table(results_dir: str) -> str:
+    rows: List[str] = [
+        "| Experiment | EM % | F1 % | LLM calls / q | ΔEM vs vanilla (pp) | Description |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for path in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
+        with open(path, encoding="utf-8") as fh:
+            res = json.load(fh)
+        name = res.get("experiment_name")
+        agg = res.get("aggregate", {}).get(name, {})
+        if not agg:
+            continue
+        deltas = [c.get(name, {}).get("delta_em") for c in res.get("comparisons_by_seed", {}).values()]
+        deltas = [d for d in deltas if d is not None]
+        delta = f"{100 * sum(deltas) / len(deltas):+.1f}" if deltas else "–"
+
+        def pct(k: str, agg: dict = agg) -> str:
+            v = agg.get(k, {}).get("mean")
+            sd = agg.get(k, {}).get("std", 0)
+            return "–" if v is None else (f"{100 * v:.1f} ± {100 * sd:.1f}" if sd else f"{100 * v:.1f}")
+
+        calls = agg.get("avg_llm_calls", {}).get("mean")
+        rows.append(f"| {name} | {pct('em')} | {pct('f1')} | {'–' if calls is None else f'{calls:.2f}'} | "
+                    f"{delta} | {res.get('description', '')} |")
+    return "\n".join(rows)
+
+
+def run_all(configs_dir: str, results_dir: str, force: bool = False) -> None:
     os.makedirs(results_dir, exist_ok=True)
-    
-    config_files = glob.glob(os.path.join(configs_dir, "*.yaml"))
-    config_files.sort()
-    
-    total = len(config_files)
-    logger.info(f"Found {total} configurations in {configs_dir}")
-    
-    start_time = time.time()
-    
-    for i, cfg_path in enumerate(config_files, 1):
-        filename = os.path.basename(cfg_path)
-        exp_name = os.path.splitext(filename)[0]
-        result_path = os.path.join(results_dir, f"{exp_name}_results.json")
-        
-        if os.path.exists(result_path) and not force:
-            logger.info(f"[{i}/{total}] Skipping {exp_name} (results already exist)")
+    configs = sorted(glob.glob(os.path.join(configs_dir, "*.yaml")))
+    # Run the full system first so its numbers exist even if a later ablation fails.
+    configs.sort(key=lambda p: (os.path.basename(p) != "full_system.yaml", p))
+    for i, path in enumerate(configs, 1):
+        name = os.path.splitext(os.path.basename(path))[0]
+        if os.path.exists(os.path.join(results_dir, f"{name}.json")) and not force:
+            logger.info("[%d/%d] %s already done, skipping", i, len(configs), name)
             continue
-            
-        logger.info(f"[{i}/{total}] Running {exp_name}...")
+        logger.info("[%d/%d] running %s", i, len(configs), name)
         try:
-            run_experiment(cfg_path, output_dir=results_dir, dry_run=False)
-        except Exception as e:
-            logger.error(f"Error running {exp_name}: {str(e)}")
-            continue
-            
-        elapsed = time.time() - start_time
-        avg_time = elapsed / i
-        eta = avg_time * (total - i)
-        logger.info(f"Estimated time remaining: {eta/60:.2f} minutes")
-        
-    # Generate master comparison table
-    compare_file = os.path.join(results_dir, "master_comparison.csv")
-    generate_comparison_table(results_dir, compare_file)
-    logger.info("All experiments completed.")
+            run_experiment(path, output_dir=results_dir)
+        except Exception as err:
+            logger.error("%s failed: %s", name, err)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--configs_dir", default=os.path.join(ROOT, "experiments", "configs"))
+    ap.add_argument("--results_dir", default=os.path.join(ROOT, "results", "experiments"))
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--table_only", action="store_true")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not args.table_only:
+        run_all(args.configs_dir, args.results_dir, args.force)
+    table = comparison_table(args.results_dir)
+    with open(os.path.join(args.results_dir, "ablations.md"), "w", encoding="utf-8") as fh:
+        fh.write(table + "\n")
+    print(table)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run all experiments sequentially")
-    parser.add_argument("--configs_dir", type=str, default="experiments/configs", help="Directory with YAML configs")
-    parser.add_argument("--results_dir", type=str, default="results", help="Directory to save results")
-    parser.add_argument("--force", action="store_true", help="Force rerun even if results exist")
-    
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    args = parser.parse_args()
-    
-    # Need to be relative to project root or use absolute path
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    configs = os.path.join(base_dir, args.configs_dir)
-    results = os.path.join(base_dir, args.results_dir)
-    
-    run_all(configs, results, args.force)
+    main()

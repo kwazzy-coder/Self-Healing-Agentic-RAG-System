@@ -1,247 +1,224 @@
 """
-agent/corrective_actions.py
-Corrective actions — smarter application of recovery strategies.
+agent/corrective_actions.py — Self-healing strategies.
+
+The monitor's failure type picks the first strategy; if a strategy was
+already tried for this question the next untried one is used, so the loop
+never repeats itself.
+
+  re_retrieve      LLM writes a targeted search query for the *missing* evidence;
+                   passages already in context are excluded so new evidence surfaces
+  expand_retrieve  widen the context with passages about the question AND the
+                   current answer/bridge entity
+  decompose        split into sub-questions (with #1 substitution) and synthesise
+  reformulate      rephrase the question, retrieve with it, answer the original
+  adopt_last_hop   (inconsistent multi-hop synthesis) use the verified last-hop answer; 0 LLM calls
+
+Retrieval-based strategies are skipped when every passage is already in the
+context (nothing new can be found), which saves LLM calls on small corpora.
+
+Choosing *which* candidate answer to keep is the pipeline's job: it re-runs
+the monitor on every candidate and keeps the best-grounded one.
 """
-import re
+from __future__ import annotations
+
 import logging
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import config
-from config import LLM_BACKEND
+from agent.cost_tracker import CURRENT_TRACKER
+from agent.multihop import merge_docs, run_subquestions
+from agent.self_monitor import FAILURE_STRATEGY_MAP, is_refusal
+from agent.task_planner import TaskPlanner
 
 logger = logging.getLogger(__name__)
 
-# Failure type → Strategy mapping
-FAILURE_STRATEGY_MAP = {
-    "empty": "expand_retrieve",
-    "refusal": "reformulate", 
-    "irrelevant": "re_retrieve",
-    "ungrounded": "re_retrieve",
-    "hallucinated": "expand_retrieve",
-    "inconsistent": "decompose",
-}
+ESCALATION_ORDER = ("re_retrieve", "decompose", "expand_retrieve", "reformulate")
+RETRIEVAL_STRATEGIES = {"re_retrieve", "expand_retrieve", "reformulate"}
+
+
+@dataclass
+class CorrectionResult:
+    strategy: str
+    new_answer: str
+    new_docs: List[str]
+    new_query: str = ""
+    action_taken: str = ""
+    sub_qas: List[Tuple[str, str]] = field(default_factory=list)
+    plan_strategy: str = "direct"  # "sequential"/"parallel" when the answer came from sub-questions
+
+    # Dict-style access for backwards compatibility (result["new_answer"]).
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "strategy": self.strategy, "new_answer": self.new_answer, "new_query": self.new_query,
+            "action_taken": self.action_taken, "n_docs": len(self.new_docs), "sub_qas": self.sub_qas,
+        }
 
 
 class CorrectiveActions:
-    """Applies corrective actions when self-monitoring detects failures."""
+    """Applies corrective strategies when the monitor flags a failure."""
 
-    def __init__(self, llm: Any, retriever: Any, cost_tracker: Any = None) -> None:
-        """
-        Initialize CorrectiveActions.
-        
-        Args:
-            llm: The LLM reasoner instance.
-            retriever: The retrieval module instance.
-            cost_tracker: Optional cost tracker instance for metric tracking.
-        """
+    def __init__(
+        self,
+        llm: Any,
+        retriever: Any = None,
+        cost_tracker: Any = None,
+        top_k: Optional[int] = None,
+        max_docs: Optional[int] = None,
+        short_answers: bool = True,
+    ) -> None:
         self.llm = llm
         self.retriever = retriever
         self.cost_tracker = cost_tracker
-        self._round = 0
-        self._best_answer: Optional[str] = None
-        self._previous_strategy: Optional[str] = None
-
-    def apply(
-        self, action: str, question: str, previous_answer: str,
-        retrieved_docs: List[str], ungrounded_sentences: Optional[List[str]] = None,
-        failure_type: str = ""
-    ) -> Dict[str, Any]:
-        """
-        Apply a corrective action to recover from a failure adaptively based on failure type.
-        
-        Args:
-            action: The suggested action from the monitor.
-            question: The user query.
-            previous_answer: The answer generated before the correction.
-            retrieved_docs: Currently retrieved context documents.
-            ungrounded_sentences: Sentences that failed grounding checks.
-            failure_type: The categorized failure type detected by the self monitor.
-            
-        Returns:
-            A dictionary containing new query, docs, answer, and action taken.
-        """
-        self._round += 1
-
-        if self._best_answer is None:
-            self._best_answer = previous_answer
-
-        # Try mapping failure type to strategy first, fallback to monitor's action suggestion
-        strategy = FAILURE_STRATEGY_MAP.get(failure_type, action)
-
-        if strategy == self._previous_strategy:
-            # Escalate if we already tried this strategy in the previous round
-            if strategy in ("re_retrieve", "expand_retrieve"):
-                strategy = "decompose"
-            elif strategy == "decompose":
-                strategy = "reformulate"
-            else:
-                strategy = "expand_retrieve"
-
-        # Fallback to round-based escalation for unknown failure types
-        if not strategy:
-            if self._round == 1:
-                strategy = "re_retrieve"
-            elif self._round == 2:
-                strategy = "decompose"
-            else:
-                strategy = "reformulate"
-
-        self._previous_strategy = strategy
-
-        if strategy == "re_retrieve" or strategy == "expand_retrieve":
-            result = self._expand_retrieve(question, retrieved_docs)
-        elif strategy == "decompose":
-            result = self._decompose(question, retrieved_docs)
-        else:
-            result = self._reformulate(question, previous_answer, retrieved_docs)
-
-        new_answer = result["new_answer"]
-        if self._is_better(new_answer, previous_answer, question):
-            result["new_answer"] = new_answer
-            logger.info("Correction improved the answer.")
-        else:
-            result["new_answer"] = previous_answer
-            result["action_taken"] += " [kept original — correction was worse]"
-            logger.info("Correction worse. Kept original answer.")
-
-        return result
+        self.top_k = top_k
+        self.max_docs = max_docs
+        self.short_answers = short_answers
+        self._tried: List[str] = []
 
     def reset_round(self) -> None:
-        """Reset the internal state for a new query."""
-        self._round = 0
-        self._best_answer = None
-        self._previous_strategy = None
+        self._tried = []
 
-    def _is_better(self, new_answer: str, old_answer: str, question: str) -> bool:
-        """Heuristic to evaluate if the new answer is an improvement."""
-        bad_phrases = ["i don't know", "cannot", "not mentioned",
-                       "no information", "unclear"]
-        new_lower = new_answer.lower().strip()
-        old_lower = old_answer.lower().strip()
-
-        if not new_lower or any(p in new_lower for p in bad_phrases):
-            return False
-
-        if len(old_lower.split()) <= 4 and not any(p in old_lower for p in bad_phrases):
-            if len(new_lower.split()) > 6:
+    def choose_strategy(self, failure_type: str, suggested: str = "", can_retrieve: bool = True,
+                        has_sub_answers: bool = False) -> Optional[str]:
+        """
+        Pick the strategy for this failure: the mapped one if it is untried and
+        feasible, otherwise the next untried feasible one. None = nothing left to try.
+        """
+        def feasible(s: str) -> bool:
+            if s in self._tried:
                 return False
+            if s in RETRIEVAL_STRATEGIES and not can_retrieve:
+                return False
+            return s != "adopt_last_hop" or has_sub_answers
 
-        return True
+        preferred = FAILURE_STRATEGY_MAP.get(failure_type) or suggested or "re_retrieve"
+        if preferred not in (*ESCALATION_ORDER, "adopt_last_hop"):
+            preferred = "re_retrieve"
+        if feasible(preferred):
+            return preferred
+        return next((s for s in ESCALATION_ORDER if feasible(s)), None)
 
-    def _expand_retrieve(self, question: str, retrieved_docs: List[str]) -> Dict[str, Any]:
-        """Add more docs to the context with a varied query."""
-        varied_query = f"more details about {question}"
-        logger.info("Expanding retrieval with query: %s", varied_query)
-        
-        extra_raw = self.retriever.retrieve(varied_query)
-        if self.cost_tracker:
-            self.cost_tracker.record_retrieval_call()
-        extra_docs = [d["text"] for d in extra_raw]
-        
-        max_docs = getattr(config, 'MAX_DOCS_PER_QUERY', 10)
-        all_docs = list(dict.fromkeys(retrieved_docs + extra_docs))[:max_docs]
-        
-        new_answer = self.llm.answer_with_context(question, all_docs)
-        if self.cost_tracker:
-            self.cost_tracker.record_llm_call()
+    def apply(
+        self,
+        action: str,
+        question: str,
+        previous_answer: str,
+        retrieved_docs: Sequence[str],
+        ungrounded_sentences: Optional[List[str]] = None,
+        failure_type: str = "",
+        index: Any = None,
+        question_type: Optional[str] = None,
+        sub_qas: Optional[List[Tuple[str, str]]] = None,
+    ) -> Optional[CorrectionResult]:
+        """Apply the best remaining strategy. Returns None when no strategy can help any more."""
+        top_k = self.top_k or config.TOP_K_RETRIEVAL
+        max_docs = self.max_docs or config.MAX_DOCS_PER_QUERY
+        docs = list(retrieved_docs)
+        can_retrieve = index is None or len(index) > len(set(docs))
+        strategy = self.choose_strategy(failure_type, action, can_retrieve=can_retrieve,
+                                        has_sub_answers=bool(sub_qas))
+        if strategy is None:
+            logger.info("No untried corrective strategy left (failure_type=%s).", failure_type)
+            return None
+        self._tried.append(strategy)
+        logger.info("Correction strategy: %s (failure_type=%s)", strategy, failure_type or "?")
 
-        return {
-            "new_query": varied_query,
-            "new_docs": all_docs,
-            "new_answer": new_answer,
-            "action_taken": f"expand_retrieve ({len(all_docs)} docs)",
-        }
-
-    def _decompose(self, question: str, retrieved_docs: List[str]) -> Dict[str, Any]:
-        """Break into sub-questions and synthesize."""
-        logger.info("Attempting decomposition for question: %s", question)
-        if LLM_BACKEND in ("gemini", "groq", "openai", "ollama"):
-            prompt = (
-                f"Split into 2 simpler sub-questions.\n"
-                f"Question: {question}\n"
-                f"Output only 2 sub-questions numbered 1. and 2.:"
-            )
-            response = self.llm.generate(prompt, max_tokens=80)
-            if self.cost_tracker:
-                self.cost_tracker.record_llm_call()
-            lines = [re.sub(r"^\d+[\.\)]\s*", "", l.strip())
-                     for l in response.split("\n") if l.strip()]
-            sub_qs = [l for l in lines if len(l) > 5][:2]
+        if strategy == "adopt_last_hop":
+            last_q, last_a = sub_qas[-1]
+            result = CorrectionResult("adopt_last_hop", last_a, docs, last_q,
+                                      f"adopt_last_hop: final answer disagreed with hop '{last_q[:50]}'",
+                                      list(sub_qas), "sequential")
+        elif strategy == "decompose":
+            result = self._decompose(question, docs, index, question_type, top_k, max_docs)
+        elif strategy == "expand_retrieve":
+            result = self._expand(question, previous_answer, docs, index, top_k, max_docs)
+        elif strategy == "reformulate":
+            result = self._reformulate(question, docs, index, top_k, max_docs)
         else:
-            sub_qs = self._heuristic_split(question)
+            result = self._targeted(question, previous_answer, docs, index, ungrounded_sentences or [],
+                                    top_k, max_docs)
+        tracker = self.cost_tracker or CURRENT_TRACKER.get()
+        if tracker:
+            tracker.record_correction_round()
+        return result
 
-        if not sub_qs:
-            logger.info("Decomposition failed, falling back to expand_retrieve")
-            return self._expand_retrieve(question, retrieved_docs)
+    # ── Strategies ───────────────────────────────────────────────────────────
+    def _answer(self, question: str, docs: Sequence[str]) -> str:
+        return self.llm.answer_with_context(question, docs, short=self.short_answers)
 
-        sub_answers = []
-        all_docs = list(retrieved_docs)
-        for sq in sub_qs:
-            extra = self.retriever.retrieve(sq)
-            if self.cost_tracker:
-                self.cost_tracker.record_retrieval_call()
-            combined = list(dict.fromkeys(all_docs + [d["text"] for d in extra]))[:8]
-            sa = self.llm.answer_with_context(sq, combined)
-            if self.cost_tracker:
-                self.cost_tracker.record_llm_call()
-            sub_answers.append(sa)
-            all_docs = combined
+    def _search(self, index: Any, query: str, top_k: int, exclude: Sequence[str] = ()) -> List[str]:
+        if index is None:
+            return []
+        tracker = self.cost_tracker or CURRENT_TRACKER.get()
+        if tracker:
+            tracker.record_retrieval_call()
+        return index.search_texts(query, top_k=top_k, exclude=list(exclude))
 
-        final = self.llm.answer_with_sub_answers(question, sub_answers, all_docs)
-        if self.cost_tracker:
-            self.cost_tracker.record_llm_call()
+    def _targeted(self, question, previous_answer, docs, index, ungrounded, top_k, max_docs) -> CorrectionResult:
+        if getattr(self.llm, "is_api", False):
+            query = self.llm.search_query(question, previous_answer, ungrounded)
+        else:
+            bridge = "" if is_refusal(previous_answer) else previous_answer
+            query = f"{question} {bridge}".strip()
+        new = self._search(index, query, top_k, exclude=docs)
+        # Keep the existing evidence and append the new passages (bounded growth).
+        all_docs = merge_docs(docs, new, max(max_docs, len(docs)) + top_k)
+        return CorrectionResult("re_retrieve", self._answer(question, all_docs), all_docs, query,
+                                f"re_retrieve: '{query[:60]}' (+{len(new)} new docs)")
 
-        return {
-            "new_query": f"[decomposed] {sub_qs}",
-            "new_docs": all_docs,
-            "new_answer": final,
-            "action_taken": f"decompose → {sub_qs}",
-        }
+    def _expand(self, question, previous_answer, docs, index, top_k, max_docs) -> CorrectionResult:
+        extra = self._search(index, question, top_k * 2, exclude=docs)
+        if previous_answer and not is_refusal(previous_answer):
+            extra = merge_docs(extra, self._search(index, previous_answer, 2, exclude=docs), 10 ** 6)
+        all_docs = merge_docs(docs, extra, max(max_docs, len(docs)) + top_k)
+        return CorrectionResult("expand_retrieve", self._answer(question, all_docs), all_docs, question,
+                                f"expand_retrieve: {len(docs)} -> {len(all_docs)} docs")
 
-    def _reformulate(self, question: str, previous_answer: str, retrieved_docs: List[str]) -> Dict[str, Any]:
-        """Rephrase question as a last resort."""
-        logger.info("Reformulating question: %s", question)
-        if LLM_BACKEND in ("gemini", "groq", "openai", "ollama"):
-            prompt = (
-                f"Rephrase this question using different keywords.\n"
-                f"Question: {question}\n"
-                f"Rephrased (output only the question):"
-            )
-            new_query = self.llm.generate(prompt, max_tokens=40).strip().strip('"\'')
-            if self.cost_tracker:
-                self.cost_tracker.record_llm_call()
-            if len(new_query) < 5:
-                new_query = question
+    def _decompose(self, question, docs, index, question_type, top_k, max_docs) -> CorrectionResult:
+        strategy = TaskPlanner.detect_strategy(question, question_type)
+        strategy = "sequential" if strategy == "direct" else strategy
+        subs: List[str] = []
+        if getattr(self.llm, "is_api", False):
+            try:
+                subs = self.llm.decompose(question, strategy)
+            except Exception as err:
+                logger.warning("Decomposition call failed: %s", err)
+        else:
+            subs = self._heuristic_split(question)
+        if len(subs) < 2:
+            logger.info("Decomposition unusable; falling back to expand_retrieve.")
+            return self._expand(question, "", docs, index, top_k, max_docs)
+        final, all_docs, sub_qas = run_subquestions(
+            self.llm, index, question, subs[:2], strategy, docs, top_k, max_docs, short=self.short_answers
+        )
+        return CorrectionResult("decompose", final, all_docs, " | ".join(q for q, _ in sub_qas),
+                                f"decompose ({strategy}): {[q for q, _ in sub_qas]}", sub_qas, strategy)
+
+    def _reformulate(self, question, docs, index, top_k, max_docs) -> CorrectionResult:
+        if getattr(self.llm, "is_api", False):
+            new_q = self.llm.rephrase(question)
         else:
             words = question.rstrip("?").split()
-            new_query = " ".join(words[-3:] + words[:3]) if len(words) > 4 else question
+            new_q = " ".join(words[-3:] + words[:3]) if len(words) > 4 else question
+        new = self._search(index, new_q, top_k, exclude=docs)
+        all_docs = merge_docs(docs, new, max(max_docs, len(docs)) + top_k)
+        return CorrectionResult("reformulate", self._answer(question, all_docs), all_docs, new_q,
+                                f"reformulate: '{new_q[:60]}'")
 
-        new_docs_raw = self.retriever.retrieve(new_query)
-        if self.cost_tracker:
-            self.cost_tracker.record_retrieval_call()
-        new_docs = [d["text"] for d in new_docs_raw]
-        all_docs = list(dict.fromkeys(retrieved_docs + new_docs))[:8]
-        new_answer = self.llm.answer_with_context(question, all_docs)
-        if self.cost_tracker:
-            self.cost_tracker.record_llm_call()
-
-        return {
-            "new_query": new_query,
-            "new_docs": all_docs,
-            "new_answer": new_answer,
-            "action_taken": f"reformulate → '{new_query[:50]}'",
-        }
-
-    def _heuristic_split(self, question: str) -> List[str]:
-        """Fallback split logic using common bridge words."""
+    @staticmethod
+    def _heuristic_split(question: str) -> List[str]:
+        """Fallback split on relative pronouns (used without an API model)."""
         q = question.lower()
-        for pivot in ["that", "who", "which", "where", "whose"]:
-            if f" {pivot} " in q:
-                idx = q.index(f" {pivot} ")
-                left = question[:idx].strip().rstrip(",")
-                right = question[idx + 1:].strip()
+        for pivot in ("that", "who", "which", "where", "whose"):
+            token = f" {pivot} "
+            if token in q:
+                idx = q.index(token)
+                left, right = question[:idx].strip().rstrip(","), question[idx + 1:].strip()
                 if len(left) > 5 and len(right) > 5:
-                    return [left + "?", right + "?"]
+                    return [left.rstrip("?") + "?", right.rstrip("?") + "?"]
         words = question.split()
         mid = len(words) // 2
-        return [" ".join(words[:mid]) + "?", " ".join(words[mid:]) + "?"]
+        return [" ".join(words[:mid]) + "?", " ".join(words[mid:])]

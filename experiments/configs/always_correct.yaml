@@ -1,0 +1,5 @@
+name: always_correct
+description: One correction on every query without consulting the monitor - value of selective healing.
+seeds: [42]
+dataset: {name: hotpotqa, n_samples: 100}
+healing: {always_correct: true}

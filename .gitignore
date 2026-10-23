@@ -1,36 +1,27 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
 *.egg-info/
 dist/
 build/
-eggs/
-*.egg
+.pytest_cache/
+.ruff_cache/
 
-# Virtual environments
+# Environments & secrets
 .venv/
 venv/
 env/
-ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Environment variables
 .env
 .env.local
 
-# Agents / Gemini
-.agents/
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
 
-# Data artifacts (uncomment if you don't want to track data files)
-# data/
+# Generated
+results/
+cache/
+.agents/

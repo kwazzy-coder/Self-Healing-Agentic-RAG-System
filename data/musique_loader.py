@@ -1,60 +1,40 @@
 """
-data/musique_loader.py — MuSiQue dataset loader
-MuSiQue: Multi-hop Questions via Single-hop Question Composition
-Harder than HotpotQA — supports 2, 3, and 4-hop reasoning.
-"""
-from datasets import load_dataset
-import random
-import logging
+data/musique_loader.py — MuSiQue (Trivedi et al., 2022): 2-4 hop questions
+composed from single-hop questions, with 20 paragraphs each (harder than HotpotQA).
 
-try:
-    from config import RANDOM_SEED
-except ImportError:
-    RANDOM_SEED = 42
+Same schema as the HotpotQA loader, so the evaluator can use either.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional
+
+import config
+from data._hf import load_first_available, seeded_sample
 
 logger = logging.getLogger(__name__)
 
-def load_musique(n_samples=100, split="validation"):
-    """
-    Load the MuSiQue dataset.
-    
-    Args:
-        n_samples: Number of samples to load.
-        split: Dataset split to load.
-        
-    Returns:
-        List of formatted dataset samples.
-    """
-    try:
-        ds = load_dataset("drt/musique", split=split, trust_remote_code=True)
-    except Exception as e:
-        logger.warning(f"Failed to load drt/musique: {e}. Trying musique...")
-        try:
-            ds = load_dataset("musique", split=split, trust_remote_code=True)
-        except Exception as e2:
-            logger.error(f"Failed to load musique dataset: {e2}")
-            return []
-            
+HUB_IDS = ("dgslibisey/MuSiQue", "bdsaglam/musique", "drt/musique")
+
+
+def load_musique(n_samples: Optional[int] = 100, split: str = "validation",
+                 seed: Optional[int] = None, answerable_only: bool = True) -> List[Dict[str, Any]]:
+    ds = load_first_available(HUB_IDS, split=split)
     samples = []
     for row in ds:
-        paragraphs = row.get("paragraphs", [])
-        context_docs = []
-        supporting_titles = []
-        for p in paragraphs:
-            context_docs.append({"title": p.get("title", ""), "text": p.get("paragraph_text", "")})
-            if p.get("is_supporting", False):
-                supporting_titles.append(p.get("title", ""))
-        
+        if answerable_only and row.get("answerable") is False:
+            continue
+        paragraphs = row.get("paragraphs", []) or []
+        hops = len(row.get("question_decomposition", []) or []) or 2
         samples.append({
             "id": row.get("id", ""),
             "question": row["question"],
             "answer": row.get("answer", ""),
-            "context_docs": context_docs,
-            "supporting_titles": list(set(supporting_titles)),
-            "type": f"{row.get('num_hops', 2)}-hop",
+            "answer_aliases": row.get("answer_aliases", []) or [],
+            "context_docs": [{"title": p.get("title", ""), "text": p.get("paragraph_text", "")} for p in paragraphs],
+            "supporting_titles": sorted({p.get("title", "") for p in paragraphs if p.get("is_supporting")}),
+            "type": f"{hops}-hop",
         })
-    
-    if n_samples and n_samples < len(samples):
-        random.seed(RANDOM_SEED)
-        samples = random.sample(samples, n_samples)
+    samples = seeded_sample(samples, n_samples, config.RANDOM_SEED if seed is None else seed)
+    logger.info("Loaded %d MuSiQue samples.", len(samples))
     return samples

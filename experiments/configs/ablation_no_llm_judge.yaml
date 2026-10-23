@@ -1,0 +1,5 @@
+name: ablation_no_llm_judge
+description: Tier 3 (LLM judge) removed - uncertain NLI band resolved at its midpoint (zero judge calls).
+seeds: [42]
+dataset: {name: hotpotqa, n_samples: 100}
+healing: {use_llm_judge: false}

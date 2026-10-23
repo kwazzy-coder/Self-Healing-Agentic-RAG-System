@@ -1,135 +1,100 @@
 """
-agent/task_planner.py — Task planning with LLM decomposition.
+agent/task_planner.py — Decides how to attack a question.
+
+Strategies
+  direct      single retrieval + answer
+  sequential  bridge question: answer sub-question 1, substitute its answer
+              into sub-question 2 ("#1" placeholder), then answer that
+  parallel    comparison question: answer each side independently, then compare
 """
-import re
+from __future__ import annotations
+
 import logging
-from dataclasses import dataclass
-from typing import List, Optional, Any
-from config import LLM_BACKEND
+import re
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_COMPARISON_CUES = ("taller", "older", "younger", "more", "less", "larger", "smaller", "first",
+                    "earlier", "later", "longer", "shorter", "bigger", "higher", "lower", "same",
+                    "both", "either")
+_BRIDGE_CUES = ("that is", "who was", "who is", "whose", "which is", "born in", "directed by",
+                "the director of", "the author of", "the founder of", "the city where",
+                "the country where", "the band that", "the company that")
+
+
 @dataclass
 class PlanResult:
-    """Dataclass holding the result of task planning."""
+    """Output of the planner."""
+
     strategy: str
-    sub_questions: List[str]
-    original: str
+    sub_questions: List[str] = field(default_factory=list)
+    original: str = ""
+
+    # Dict-style access keeps older code (plan["strategy"]) working.
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
 
 class TaskPlanner:
-    """Task planning with LLM decomposition."""
-    
+    """Detects multi-hop structure and decomposes questions with the LLM."""
+
     MIN_SUB_QUESTION_LENGTH = 8
-    
-    def __init__(self, llm: Any) -> None:
-        """
-        Initialize the TaskPlanner.
-        
-        Args:
-            llm: The LLM reasoner instance.
-        """
+
+    def __init__(self, llm: Any, enable_decomposition: bool = True) -> None:
         self.llm = llm
+        self.enable_decomposition = enable_decomposition
 
     def plan(self, question: str, question_type: Optional[str] = None) -> PlanResult:
-        """
-        Plan the task strategy and optionally decompose the question.
-        
-        Args:
-            question: The original user question.
-            question_type: Optional predefined question type.
-            
-        Returns:
-            PlanResult containing the strategy, sub-questions, and original question.
-        """
-        strategy = self._detect_strategy(question, question_type)
+        strategy = self.detect_strategy(question, question_type)
+        if strategy == "direct" or not self.enable_decomposition:
+            return PlanResult(strategy=strategy, sub_questions=[], original=question)
 
-        if strategy == "direct":
-            logger.info("Using direct strategy for question: %s", question)
-            return PlanResult(strategy="direct", sub_questions=[], original=question)
-
-        # Enable decomposition for all capable backends
-        if LLM_BACKEND in ("gemini", "groq", "openai", "ollama"):
-            logger.info("Attempting LLM decomposition for strategy: %s", strategy)
-            sub_questions = self._decompose_llm(question, strategy)
-            sub_questions = [
-                q for q in sub_questions
-                if len(q) > self.MIN_SUB_QUESTION_LENGTH
-                and q.lower() != question.lower()
-                and not q[0].isdigit()
+        if getattr(self.llm, "is_api", False):
+            try:
+                subs = self.llm.decompose(question, strategy)
+            except Exception as err:
+                logger.warning("Decomposition failed (%s); answering directly.", err)
+                subs = []
+            subs = [
+                q for q in subs
+                if len(q) > self.MIN_SUB_QUESTION_LENGTH and q.strip().lower() != question.strip().lower()
             ]
-            if len(sub_questions) >= 2:
-                logger.info("Successfully decomposed into %d sub-questions", len(sub_questions))
-                return PlanResult(strategy=strategy, sub_questions=sub_questions, original=question)
+            if len(subs) >= 2:
+                return PlanResult(strategy=strategy, sub_questions=subs[:2], original=question)
 
-        logger.info("Fallback to direct strategy for question: %s", question)
+        logger.info("No usable decomposition; answering '%s' directly with full context.", strategy)
         return PlanResult(strategy=strategy, sub_questions=[], original=question)
 
-    def _detect_strategy(self, question: str, question_type: Optional[str]) -> str:
-        """
-        Detect the reasoning strategy for a given question.
-        
-        Args:
-            question: The question text.
-            question_type: The explicitly provided question type, if any.
-            
-        Returns:
-            The strategy string ('direct', 'sequential', or 'parallel').
-        """
+    @staticmethod
+    def detect_strategy(question: str, question_type: Optional[str] = None) -> str:
+        """Map a dataset question type (or keyword cues) to a strategy."""
         if question_type:
-            if question_type == "bridge":
+            qt = question_type.lower()
+            if qt == "bridge":
                 return "sequential"
-            if question_type == "comparison":
+            if qt == "comparison":
                 return "parallel"
+            if qt in ("sequential", "parallel"):
+                return qt
             return "direct"
-            
-        # Auto-detect from question
-        q_lower = question.lower()
-        
-        # Comparison patterns
-        comparison_words = ["which", "who is", "taller", "older", "more", "less", "better", "worse", "larger", "smaller"]
-        if any(word in q_lower for word in comparison_words) and (" or " in q_lower or " and " in q_lower):
+
+        q = question.lower()
+        if (" or " in q or " and " in q) and any(re.search(rf"\b{c}\b", q) for c in _COMPARISON_CUES):
             return "parallel"
-            
-        # Bridge patterns (relative clauses)
-        bridge_words = ["that is", "who was", "whose", "which is", "born in", "directed by"]
-        if any(word in q_lower for word in bridge_words):
+        if any(cue in q for cue in _BRIDGE_CUES):
             return "sequential"
-            
         return "direct"
 
-    def _decompose_llm(self, question: str, strategy: str) -> List[str]:
-        """
-        Decompose a question into sub-questions using the LLM.
-        
-        Args:
-            question: The question to decompose.
-            strategy: The strategy to use ('sequential' or 'parallel').
-            
-        Returns:
-            A list of sub-questions.
-        """
-        if strategy == "sequential":
-            prompt = (
-                f"Break this 2-hop question into 2 sub-questions to answer in order.\n"
-                f"The answer to sub-question 1 should help answer sub-question 2.\n"
-                f"Output ONLY 2 sub-questions, numbered 1. and 2. No other text.\n\n"
-                f"Question: {question}\n\n"
-                f"1."
-            )
-        else:
-            prompt = (
-                f"Break this comparison question into 2 independent sub-questions.\n"
-                f"Output ONLY 2 sub-questions, numbered 1. and 2. No other text.\n\n"
-                f"Question: {question}\n\n"
-                f"1."
-            )
+    # Backwards-compatible name
+    _detect_strategy = detect_strategy
 
-        response = self.llm.generate(prompt, max_tokens=80)
-        full = "1." + response if not response.startswith("1") else response
-        lines = [l.strip() for l in full.split("\n") if l.strip()]
-        sub_qs = []
-        for line in lines:
-            clean = re.sub(r"^\d+[\.\)]\s*", "", line).strip()
-            if clean:
-                sub_qs.append(clean)
-        return sub_qs[:2]
+
+def substitute_previous_answer(sub_question: str, previous_answer: str) -> str:
+    """Replace '#1' (or a trailing '[answer]'-style placeholder) with the previous hop's answer."""
+    if not previous_answer:
+        return sub_question
+    out = re.sub(r"#1\b", previous_answer, sub_question)
+    out = re.sub(r"\[(answer|ans|a1|entity)[^\]]*\]", previous_answer, out, flags=re.I)
+    return out

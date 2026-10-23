@@ -1,102 +1,140 @@
 """
-run_evaluation.py
-Entry point — runs the full evaluation pipeline.
+run_evaluation.py — Command-line entry point for all evaluations.
 
-Usage examples:
-  python run_evaluation.py --dataset hotpotqa --n_samples 100
-  python run_evaluation.py --dataset hotpotqa --n_samples 200 --compare_baseline
-  python run_evaluation.py --dataset ragbench --subset covidqa --n_samples 100
-  python run_evaluation.py --dataset ragbench --subset hotpotqa --n_samples 100
-  python run_evaluation.py --dataset both --n_samples 100
+Examples
+--------
+# Self-healing vs vanilla RAG on 100 HotpotQA questions (paired significance tests included)
+python run_evaluation.py --dataset hotpotqa --n_samples 100 --compare_baseline
+
+# Any set of systems (see baselines/__init__.py)
+python run_evaluation.py --dataset hotpotqa --n_samples 100 \
+    --systems vanilla_rag,planner_only,self_healing,llm_judge_only
+
+# Only bridge questions
+python run_evaluation.py --dataset hotpotqa --n_samples 100 --question_type bridge --compare_baseline
+
+# Hallucination-detector benchmark on RAGBench (heuristic+NLI needs NO API key)
+python run_evaluation.py --dataset ragbench --subset covidqa --mode detector \
+    --monitors heuristic,heuristic_nli,tiered
+
+# Long-form QA on RAGBench
+python run_evaluation.py --dataset ragbench --subset msmarco --mode qa --compare_baseline
+
+Results go to results/<tag>/ (per-sample JSONL, summary.json, report.md).
+Re-running the same command resumes where it stopped.
 """
+from __future__ import annotations
 
 import argparse
-import json
-import os
-from pipeline import SelfHealingRAGPipeline
-from evaluation.evaluator import Evaluator
-from evaluation.metrics import format_results_table
+import logging
+import sys
+from typing import Dict, List
+
+import config
+
+logger = logging.getLogger("run_evaluation")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Self-Healing Agentic RAG Evaluation")
-    parser.add_argument(
-        "--dataset", choices=["hotpotqa", "ragbench", "both"], default="hotpotqa",
-        help="Dataset to evaluate on"
-    )
-    parser.add_argument(
-        "--subset", default="hotpotqa",
-        help="RAGBench subset (covidqa, hotpotqa, msmarco, pubmedqa, expertqa, ...)"
-    )
-    parser.add_argument(
-        "--setting", choices=["distractor", "fullwiki"], default="distractor",
-        help="HotpotQA setting"
-    )
-    parser.add_argument(
-        "--n_samples", type=int, default=100,
-        help="Number of samples to evaluate"
-    )
-    parser.add_argument(
-        "--compare_baseline", action="store_true",
-        help="Also run baseline (no self-healing) for comparison"
-    )
-    return parser.parse_args()
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Self-Healing Agentic RAG — evaluation")
+    p.add_argument("--dataset", choices=["hotpotqa", "musique", "ragbench"], default="hotpotqa")
+    p.add_argument("--subset", default="covidqa", help="RAGBench subset (covidqa, hotpotqa, msmarco, pubmedqa, ...)")
+    p.add_argument("--setting", choices=["distractor", "fullwiki"], default="distractor")
+    p.add_argument("--question_type", choices=["bridge", "comparison"], default=None)
+    p.add_argument("--mode", choices=["qa", "detector"], default="qa")
+    p.add_argument("--n_samples", type=int, default=100)
+    p.add_argument("--seed", type=int, default=config.RANDOM_SEED)
+    p.add_argument("--systems", default="self_healing",
+                   help="comma-separated: vanilla_rag, planner_only, self_healing, nli_only, "
+                        "llm_judge_only, always_correct, crag")
+    p.add_argument("--compare_baseline", action="store_true", help="shortcut: add vanilla_rag as reference")
+    p.add_argument("--monitors", default="heuristic,heuristic_nli,tiered",
+                   help="detector mode: comma-separated monitor modes "
+                        "(heuristic, nli, heuristic_nli, heuristic_llm, llm, tiered)")
+    p.add_argument("--provider", default=None, help="override LLM_BACKEND (gemini, groq, openai, ollama, huggingface)")
+    p.add_argument("--model", default=None, help="override the model id")
+    p.add_argument("--tag", default=None, help="results sub-directory name")
+    p.add_argument("--no_resume", action="store_true", help="start from scratch instead of resuming")
+    return p.parse_args(argv)
 
 
-def main():
-    args = parse_args()
-    pipeline = SelfHealingRAGPipeline()
-    evaluator = Evaluator(pipeline)
-    all_metrics = []
-
-    # ── HotpotQA Evaluation ────────────────────────────────────────────────────
-    if args.dataset in ("hotpotqa", "both"):
+def load_samples(args: argparse.Namespace) -> List[Dict]:
+    if args.dataset == "hotpotqa":
         from data.hotpotqa_loader import load_hotpotqa
-        samples = load_hotpotqa(n_samples=args.n_samples, setting=args.setting)
-        metrics = evaluator.evaluate_hotpotqa(samples, compare_baseline=args.compare_baseline)
-        all_metrics.append(("Self-Healing RAG (HotpotQA)", metrics))
 
-        if args.compare_baseline and "baseline_em" in metrics:
-            all_metrics.append((
-                "Baseline RAG (HotpotQA)",
-                {"em": metrics["baseline_em"], "f1": metrics["baseline_f1"],
-                 "hallucination_rate": 1.0, "correction_rate": 0.0}
-            ))
+        return load_hotpotqa(args.n_samples, setting=args.setting, seed=args.seed, question_type=args.question_type)
+    if args.dataset == "musique":
+        from data.musique_loader import load_musique
 
-    # ── RAGBench Evaluation ────────────────────────────────────────────────────
-    if args.dataset in ("ragbench", "both"):
-        from data.ragbench_loader import load_ragbench
-        subsets = (
-            ["covidqa", "hotpotqa", "msmarco"]
-            if args.dataset == "both"
-            else [args.subset]
-        )
-        for subset in subsets:
-            try:
-                samples = load_ragbench(subset=subset, split="test", n_samples=args.n_samples)
-                metrics = evaluator.evaluate_ragbench(samples, subset=subset)
-                all_metrics.append((f"Self-Healing RAG (RAGBench/{subset})", metrics))
-            except Exception as e:
-                print(f"[Warning] Could not load RAGBench subset '{subset}': {e}")
+        return load_musique(args.n_samples, seed=args.seed)
+    from data.ragbench_loader import load_ragbench
 
-    # ── Print Comparison Table ─────────────────────────────────────────────────
-    if len(all_metrics) > 1:
-        print("\n" + format_results_table(all_metrics))
+    return load_ragbench(args.subset, split="test", n_samples=args.n_samples, seed=args.seed)
 
-    # ── Save summary ───────────────────────────────────────────────────────────
-    os.makedirs("results", exist_ok=True)
-    summary_path = "results/summary.json"
-    with open(summary_path, "w") as f:
-        json.dump({name: m for name, m in all_metrics}, f, indent=2)
-    print(f"\n[Summary] All results saved to {summary_path}")
+
+def default_tag(args: argparse.Namespace) -> str:
+    name = args.dataset + (f"-{args.subset}" if args.dataset == "ragbench" else "")
+    if args.question_type:
+        name += f"-{args.question_type}"
+    return f"{name}_{args.mode}_n{args.n_samples}_s{args.seed}"
+
+
+def main(argv: List[str] | None = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", force=True)
+    if args.model:
+        config.LLM_MODEL = args.model
+
+    from agent.llm_reasoner import LLMReasoner
+    from evaluation.evaluator import Evaluator
+    from pipeline import Components
+
+    samples = load_samples(args)
+    if not samples:
+        logger.error("No samples loaded.")
+        return 1
+    tag = args.tag or default_tag(args)
+    evaluator = Evaluator()
+
+    if args.mode == "detector":
+        if args.dataset != "ragbench":
+            logger.error("--mode detector needs labelled responses: use --dataset ragbench.")
+            return 1
+        from agent.nli import NLIScorer
+        from agent.self_monitor import MonitorSettings, SelfMonitor
+
+        modes = [m.strip() for m in args.monitors.split(",") if m.strip()]
+        needs_llm = any(MonitorSettings.from_mode(m).use_llm_judge for m in modes)
+        llm = LLMReasoner(args.provider) if needs_llm else None
+        nli = NLIScorer()
+        monitors = {m: SelfMonitor(llm, nli=nli, settings=MonitorSettings.from_mode(m, short_answers=False))
+                    for m in modes}
+        meta = {"dataset": f"ragbench/{args.subset}", "n": len(samples), "seed": args.seed,
+                "llm": f"{llm.backend}/{llm.model}" if llm else "none", "nli": config.NLI_MODEL,
+                "nli_band": f"[{config.NLI_LOW}, {config.NLI_HIGH}]"}
+        summary = evaluator.evaluate_detector(monitors, samples, tag, resume=not args.no_resume, meta=meta)
+    else:
+        from baselines import build_system
+
+        names = [s.strip() for s in args.systems.split(",") if s.strip()]
+        if args.compare_baseline and "vanilla_rag" not in names:
+            names.insert(0, "vanilla_rag")
+        components = Components.build(llm=LLMReasoner(args.provider))
+        long_answers = args.dataset == "ragbench"
+        systems = {n: build_system(n, components, short_answers=not long_answers) for n in names}
+        meta = {"dataset": args.dataset + (f"/{args.subset}" if args.dataset == "ragbench" else ""),
+                "n": len(samples), "seed": args.seed, "llm": f"{components.llm.backend}/{components.llm.model}",
+                "top_k": config.TOP_K_RETRIEVAL, "max_rounds": config.MAX_CORRECTION_ATTEMPTS}
+        summary = evaluator.evaluate_qa(systems, samples, tag, long_answers=long_answers,
+                                        resume=not args.no_resume, meta=meta)
+
+    from analysis.report import render_markdown
+
+    print("\n" + render_markdown(summary))
+    print(f"Saved to {config.RESULTS_DIR}/{tag}/")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-
-
-# ── Quick preset commands (add to bottom of file for reference) ────────────────
-# python run_evaluation.py --dataset hotpotqa --n_samples 200 --compare_baseline
-# python run_evaluation.py --dataset ragbench --subset covidqa --n_samples 100
-# python run_evaluation.py --dataset ragbench --subset hotpotqa --n_samples 100
-# python run_evaluation.py --dataset both --n_samples 100
+    sys.exit(main())

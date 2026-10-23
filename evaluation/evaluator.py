@@ -1,318 +1,367 @@
 """
-evaluation/evaluator.py — Clean evaluation with logging and statistical rigor.
+evaluation/evaluator.py — Runs systems over a dataset and scores them.
+
+Two evaluation modes
+--------------------
+1. QA (HotpotQA / MuSiQue / RAGBench-QA): every system answers every
+   question; we report EM/F1 with bootstrap CIs, paired significance tests
+   against the reference system, cost, and a *healing analysis* (how often the
+   monitor flagged a wrong answer, how many wrong answers healing fixed and
+   how many right answers it broke).
+
+2. Detector (RAGBench): the self-monitor is run on RAGBench's *given*
+   responses and compared with the human/GPT-4 grounding labels. This is the
+   correct way to measure hallucination detection (the original code compared
+   the monitor's flag on its own answer with the label of a different answer).
+
+Progress is checkpointed to JSONL after every sample, so long runs on
+rate-limited free tiers can be stopped and resumed.
 """
+from __future__ import annotations
+
 import json
+import logging
 import os
 import time
-import logging
-from typing import List, Dict, Any, Optional
-from tqdm import tqdm
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-from pipeline import SelfHealingRAGPipeline
+import config
+from agent.cost_tracker import CURRENT_TRACKER, CostTracker, aggregate_costs
 from evaluation.metrics import (
-    exact_match, token_f1, rouge_l, bert_score_metric, contains_match,
-    supporting_doc_f1, retrieval_recall_at_k, retrieval_mrr,
-    compute_aggregate_metrics, compute_per_type_metrics, format_results_table,
-    print_metrics
+    best_over_golds,
+    binary_classification_metrics,
+    contains_match,
+    exact_match,
+    retrieval_recall_at_k,
+    roc_auc,
+    rouge_l,
+    supporting_doc_f1,
+    token_f1,
 )
-from evaluation.statistical import bootstrap_confidence_interval, format_with_ci
-from config import RESULTS_DIR
+from evaluation.statistical import bootstrap_confidence_interval, mcnemar_test, paired_bootstrap_test
+from retrieval.retriever import extract_title
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(it, **_):  # type: ignore
+        return it
 
-class Evaluator:
-    """
-    Evaluator class for assessing RAG pipeline performance.
-    """
-    def __init__(self, pipeline: SelfHealingRAGPipeline):
-        self.pipeline = pipeline
-        os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    def evaluate_hotpotqa(self, samples: List[Dict[str, Any]], compare_baseline: bool = False) -> Dict[str, Any]:
-        """
-        Evaluate the pipeline on HotpotQA dataset.
-        """
-        logger.info(f"Running on {len(samples)} HotpotQA samples...")
-        results = []
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def sample_documents(sample: Dict[str, Any]) -> List[str]:
+    """Documents for a sample as 'Title: ...\\n<text>' strings."""
+    if "documents" in sample:
+        return list(sample["documents"])
+    return [f"Title: {d['title']}\n{d['text']}" for d in sample.get("context_docs", [])]
 
-        for sample in tqdm(samples, desc="HotpotQA"):
-            start_time = time.time()
-            
-            docs = [f"Title: {d['title']}\n{d['text']}" for d in sample["context_docs"]]
-            gold_answer = sample["answer"]
-            gold_support = list(set(sample["supporting_titles"]))
-            q_type = sample.get("type", "unknown")
 
-            # Baseline
-            base_em, base_f1, base_rouge, base_answer = 0.0, 0.0, 0.0, ""
-            base_failure = False
-            if compare_baseline:
-                base = self.pipeline.run_baseline(question=sample["question"], documents=docs)
-                base_answer = base.get("answer", "")
-                base_em = exact_match(base_answer, gold_answer)
-                base_f1 = token_f1(base_answer, gold_answer)
-                base_rouge = rouge_l(base_answer, gold_answer)
-                # For baseline, failure is generally assumed false unless reported
-                base_failure = base.get("failure_detected", False) 
+def sample_golds(sample: Dict[str, Any]) -> List[str]:
+    gold = sample.get("answer") or sample.get("gold_response") or ""
+    return [gold, *sample.get("answer_aliases", [])]
 
-            # Self-Healing
-            output = self.pipeline.run(
-                question=sample["question"],
-                documents=docs,
-                question_type=q_type,
-            )
-            
-            latency = time.time() - start_time
-            pred_answer = output.get("final_answer", "")
-            
-            retrieved_titles = self._extract_titles(output.get("retrieved_docs", []))
-            
-            em = exact_match(pred_answer, gold_answer)
-            f1 = token_f1(pred_answer, gold_answer)
-            rouge = rouge_l(pred_answer, gold_answer)
-            contains = contains_match(pred_answer, gold_answer)
-            bert = bert_score_metric(pred_answer, gold_answer)
-            
-            sup_f1 = supporting_doc_f1(retrieved_titles, gold_support)
-            rec_at_k = retrieval_recall_at_k(retrieved_titles, gold_support, k=3)
-            mrr = retrieval_mrr(retrieved_titles, gold_support)
 
-            correction_succeeded = (
-                output.get("correction_attempted", False) and em >= base_em
-            ) if compare_baseline else output.get("correction_attempted", False)
+def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
 
-            res_dict = {
-                "id": sample["id"],
-                "question": sample["question"],
-                "question_type": q_type,
-                "gold_answer": gold_answer,
-                "predicted_answer": pred_answer,
-                "baseline_answer": base_answer,
-                "em": em, 
-                "f1": f1,
-                "rouge_l": rouge,
-                "contains": contains,
-                "bert_score_f1": bert.get("f1", 0.0),
-                "sup_f1": sup_f1,
-                "recall_at_k": rec_at_k,
-                "mrr": mrr,
-                "baseline_em": base_em,
-                "baseline_f1": base_f1,
-                "baseline_rouge": base_rouge,
-                "baseline_failure": base_failure,
-                "has_failure": output.get("failure_detected", False),
-                "correction_attempted": output.get("correction_attempted", False),
-                "correction_succeeded": correction_succeeded,
-                "n_correction_rounds": output.get("n_correction_rounds", 0),
-                "failure_reason": output.get("failure_reason", ""),
-                "self_healing_helped": em > base_em if compare_baseline else False,
-                "self_healing_hurt": em < base_em if compare_baseline else False,
-                "latency_s": latency
-            }
-            results.append(res_dict)
 
-        # Overall Metrics
-        metrics = compute_aggregate_metrics(results)
-        
-        # Per-Type Metrics
-        type_metrics = compute_per_type_metrics(results)
-        metrics["per_question_type"] = type_metrics
-        
-        # Add Confidence Intervals for key metrics
-        for key in ["em", "f1", "rouge_l"]:
-            scores = [r[key] for r in results]
-            mean, lower, upper = bootstrap_confidence_interval(scores)
-            metrics[f"{key}_ci"] = format_with_ci(mean, lower, upper)
+def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-        if compare_baseline:
-            n = len(results)
-            base_em_avg = sum(r["baseline_em"] for r in results) / n
-            base_f1_avg = sum(r["baseline_f1"] for r in results) / n
-            base_rouge_avg = sum(r["baseline_rouge"] for r in results) / n
-            base_fail_avg = sum(r["baseline_failure"] for r in results) / n
-            helped = [r for r in results if r.get("self_healing_helped")]
-            hurt = [r for r in results if r.get("self_healing_hurt")]
-            
-            metrics.update({
-                "baseline_em": base_em_avg,
-                "baseline_f1": base_f1_avg,
-                "baseline_rouge_l": base_rouge_avg,
-                "baseline_failure_rate": base_fail_avg,
-                "em_improvement": metrics.get("em", 0) - base_em_avg,
-                "f1_improvement": metrics.get("f1", 0) - base_f1_avg,
-                "net_improvement_rate": len(helped) / n,
-                "net_hurt_rate": len(hurt) / n,
-            })
 
-        self._print_clean_metrics(metrics)
-        
-        if type_metrics:
-            logger.info("  ── Per Question Type Breakdown ──")
-            for qt, qtm in type_metrics.items():
-                logger.info(f"  [{qt.upper()}] EM: {qtm.get('em', 0):.3f} | F1: {qtm.get('f1', 0):.3f} | Failure: {qtm.get('failure_detected_rate', 0):.3f}")
+def _mean(xs: Iterable[float]) -> float:
+    xs = list(xs)
+    return sum(xs) / len(xs) if xs else 0.0
 
-        if compare_baseline:
-            self._print_correction_analysis(results)
-            self._print_comparison_table(metrics, compare_baseline)
 
-        self._save_results(results, metrics, "hotpotqa")
-        return metrics
+# ── Scoring a single QA prediction ───────────────────────────────────────────
+def score_qa_record(sample: Dict[str, Any], output: Any, system: str, long_answers: bool,
+                    latency: float) -> Dict[str, Any]:
+    golds = sample_golds(sample)
+    pred, init = output.final_answer, output.initial_answer
+    titles = [extract_title(d) for d in output.retrieved_docs]
+    gold_titles = sample.get("supporting_titles", [])
+    rec = {
+        "id": sample.get("id", ""),
+        "system": system,
+        "question": sample["question"],
+        "question_type": sample.get("type", "unknown") or "unknown",
+        "gold": golds[0],
+        "answer": pred,
+        "initial_answer": init,
+        "em": best_over_golds(exact_match, pred, golds),
+        "f1": best_over_golds(token_f1, pred, golds),
+        "contains": best_over_golds(contains_match, pred, golds),
+        "initial_em": best_over_golds(exact_match, init, golds),
+        "initial_f1": best_over_golds(token_f1, init, golds),
+        "failure_detected": bool(output.failure_detected),
+        "failure_type": output.failure_type,
+        "correction_attempted": bool(output.correction_attempted),
+        "n_correction_rounds": output.n_correction_rounds,
+        "selected_round": output.selected_round,
+        "verified": output.verified,
+        "initial_monitor_tier": output.initial_monitor_tier,
+        "strategy": output.strategy,
+        "rounds": [r if isinstance(r, dict) else r.__dict__ for r in output.rounds],
+        "cost": output.cost_data,
+        "latency_s": latency,
+        "error": None,
+    }
+    if gold_titles:
+        rec["sup_f1"] = supporting_doc_f1(titles, gold_titles)
+        rec["support_recall"] = retrieval_recall_at_k(titles, gold_titles)
+    if long_answers:
+        rec["rouge_l"] = rouge_l(pred, golds[0])
+    return rec
 
-    def _print_clean_metrics(self, metrics: Dict[str, Any]):
-        """Print metrics table exactly once, cleanly using logger."""
-        logger.info(f"\n{'='*50}\n  HotpotQA Results\n{'='*50}")
-        
-        keys_order = [
-            "n_samples", "em", "em_ci", "f1", "f1_ci", "rouge_l", "rouge_l_ci", 
-            "bert_score_f1", "contains_match",
-            "supporting_facts_f1", "retrieval_recall_at_k", "retrieval_mrr",
-            "failure_detected_rate", "correction_attempted_rate",
-            "correction_success_rate", "avg_latency_s",
-            "baseline_em", "baseline_f1",
-            "em_improvement", "f1_improvement",
-            "net_improvement_rate", "net_hurt_rate",
-        ]
-        for k in keys_order:
-            if k in metrics:
-                v = metrics[k]
-                if isinstance(v, float):
-                    logger.info(f"  {k:<35}: {v:.4f}")
-                else:
-                    logger.info(f"  {k:<35}: {v}")
-        logger.info(f"{'='*50}\n")
 
-    def _print_correction_analysis(self, results: List[Dict[str, Any]]):
-        """Print correction analysis."""
-        n = len(results)
-        if n == 0:
-            return
-            
-        helped = sum(1 for r in results if r.get("self_healing_helped"))
-        hurt = sum(1 for r in results if r.get("self_healing_hurt"))
-        same = n - helped - hurt
-        attempted = sum(1 for r in results if r["correction_attempted"])
+def _is_correct(rec: Dict[str, Any], key: str = "em", long_answers: bool = False) -> bool:
+    if long_answers:
+        return rec.get("f1" if key == "em" else "initial_f1", 0.0) >= 0.5
+    return rec.get(key, 0.0) >= 1.0
 
-        logger.info("  ── Correction Impact Analysis ──")
-        logger.info(f"  Corrections attempted : {attempted}/{n}")
-        logger.info(f"  Self-healing HELPED   : {helped} samples")
-        logger.info(f"  Self-healing HURT     : {hurt} samples")
-        logger.info(f"  No change             : {same} samples")
-        logger.info(f"  Net beneficial rate   : {helped/n:.1%}\n")
 
-    def _print_comparison_table(self, metrics: Dict[str, Any], compare_baseline: bool):
-        """Print clean comparison table using standard markdown layout."""
-        sh_em = metrics.get("em", 0)
-        sh_f1 = metrics.get("f1", 0)
-        sh_rouge = metrics.get("rouge_l", 0)
-        sh_cor = metrics.get("correction_success_rate", 0)
+# ── Aggregation ──────────────────────────────────────────────────────────────
+def summarize_qa(records: List[Dict[str, Any]], long_answers: bool = False) -> Dict[str, Any]:
+    ok = [r for r in records if not r.get("error")]
+    n = len(ok)
+    out: Dict[str, Any] = {"n_samples": n, "n_errors": len(records) - n}
+    if n == 0:
+        return out
+    for key in ("em", "f1", "contains", "sup_f1", "support_recall", "rouge_l"):
+        vals = [r[key] for r in ok if key in r]
+        if vals:
+            mean, lo, hi = bootstrap_confidence_interval(vals)
+            out[key] = mean
+            out[f"{key}_ci"] = [lo, hi]
+    out["avg_latency_s"] = _mean(r["latency_s"] for r in ok)
+    out.update({k: v for k, v in aggregate_costs([r["cost"] for r in ok]).items() if k != "n_queries"})
+    out["failure_detected_rate"] = _mean(r["failure_detected"] for r in ok)
+    verified = [r for r in ok if r.get("verified") is not None]
+    if verified:
+        # Selective answering: accuracy on the answers the monitor vouched for.
+        out["verified_rate"] = _mean(r["verified"] for r in verified)
+        vouched = [r for r in verified if r["verified"]]
+        out["em_when_verified"] = _mean(r["em"] for r in vouched) if vouched else None
+        unvouched = [r for r in verified if not r["verified"]]
+        out["em_when_unverified"] = _mean(r["em"] for r in unvouched) if unvouched else None
+    out["correction_attempted_rate"] = _mean(r["correction_attempted"] for r in ok)
 
-        metrics_list = [
-            ("Self-Healing RAG", {
-                "em": sh_em, "f1": sh_f1, "rouge_l": sh_rouge, "correction_success_rate": sh_cor
-            })
-        ]
-        
-        if compare_baseline:
-            metrics_list.append(
-                ("Baseline RAG", {
-                    "em": metrics.get("baseline_em", 0),
-                    "f1": metrics.get("baseline_f1", 0),
-                    "rouge_l": metrics.get("baseline_rouge_l", 0),
-                    "correction_success_rate": 0.0 # Baseline has no self-correction
-                })
-            )
-            
-        table_str = format_results_table(metrics_list)
-        logger.info(f"Comparison Table:\n{table_str}")
-
-    def evaluate_ragbench(self, samples: List[Dict[str, Any]], subset: str = "ragbench") -> Dict[str, Any]:
-        """
-        Evaluate the pipeline on RAGBench dataset.
-        """
-        logger.info(f"Running {len(samples)} RAGBench '{subset}' samples...")
-        results = []
-
-        for sample in tqdm(samples, desc=f"RAGBench/{subset}"):
-            start_time = time.time()
-            output = self.pipeline.run(
-                question=sample["question"], documents=sample["documents"]
-            )
-            latency = time.time() - start_time
-            pred = output.get("final_answer", "")
-            
-            f1_gold = token_f1(pred, sample["gold_response"])
-            rouge = rouge_l(pred, sample["gold_response"])
-            bert = bert_score_metric(pred, sample["gold_response"])
-            
-            gold_hallucinated = not sample.get("adherence_score", True)
-            system_flagged = output.get("failure_detected", False)
-            detection_correct = (system_flagged == gold_hallucinated)
-
-            results.append({
-                "id": sample["id"],
-                "question": sample["question"],
-                "predicted": pred,
-                "f1_vs_gold": f1_gold,
-                "rouge_l": rouge,
-                "bert_score_f1": bert.get("f1", 0.0),
-                "has_failure": system_flagged,
-                "correction_attempted": output.get("correction_attempted", False),
-                "gold_is_hallucinated": gold_hallucinated,
-                "system_flagged": system_flagged,
-                "detection_correct": detection_correct,
-                "system_grounded": not system_flagged,
-                "latency_s": latency
-            })
-
-        n = len(results)
-        if n == 0:
-            return {}
-            
-        failures = [r for r in results if r["has_failure"]]
-        attempted = [r for r in results if r["correction_attempted"]]
-        f1_scores = [r["f1_vs_gold"] for r in results]
-        
-        tp = sum(1 for r in results if r["system_flagged"] and r["gold_is_hallucinated"])
-        fp = sum(1 for r in results if r["system_flagged"] and not r["gold_is_hallucinated"])
-        fn = sum(1 for r in results if not r["system_flagged"] and r["gold_is_hallucinated"])
-        
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1_detect = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-
-        latencies = [r["latency_s"] for r in results]
-
-        metrics = {
-            "n_samples": n,
-            "f1_vs_gold_response": sum(f1_scores) / n,
-            "failure_detected_rate": len(failures) / n,
-            "correction_attempted_rate": len(attempted) / len(failures) if failures else 0.0,
-            "system_grounded_rate": sum(1 for r in results if r["system_grounded"]) / n,
-            "halluc_detection_precision": precision,
-            "halluc_detection_recall": recall,
-            "halluc_detection_f1": f1_detect,
-            "halluc_detection_accuracy": sum(1 for r in results if r["detection_correct"]) / n,
-            "avg_latency_s": sum(latencies) / n if latencies else 0.0
+    # Healing analysis: did the monitor flag the right answers, and did healing help?
+    monitored = [r for r in ok if any(rd.get("has_failure") is not None for rd in r.get("rounds", []))]
+    if monitored:
+        init_wrong = [r for r in monitored if not _is_correct(r, "initial_em", long_answers)]
+        init_right = [r for r in monitored if _is_correct(r, "initial_em", long_answers)]
+        flagged = [r for r in monitored if r["failure_detected"]]
+        fixed = [r for r in init_wrong if r["failure_detected"] and _is_correct(r, "em", long_answers)]
+        broken = [r for r in init_right if r["failure_detected"] and not _is_correct(r, "em", long_answers)]
+        flagged_wrong = [r for r in flagged if not _is_correct(r, "initial_em", long_answers)]
+        out["healing"] = {
+            "n_monitored": len(monitored),
+            "initial_accuracy": len(init_right) / len(monitored),
+            # None (rendered as "–") when undefined, instead of a misleading 0.0
+            "monitor_precision": len(flagged_wrong) / len(flagged) if flagged else None,
+            "monitor_recall": (sum(1 for r in init_wrong if r["failure_detected"]) / len(init_wrong)
+                               if init_wrong else None),
+            "fixed": len(fixed),
+            "broken": len(broken),
+            "fix_rate": len(fixed) / max(1, sum(1 for r in init_wrong if r["failure_detected"])),
+            "break_rate": len(broken) / max(1, sum(1 for r in init_right if r["failure_detected"])),
+            "net_gain": (len(fixed) - len(broken)) / len(monitored),
         }
 
-        print_metrics(metrics, title=f"RAGBench/{subset} Results")
-        self._save_results(results, metrics, f"ragbench_{subset}")
-        return metrics
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for r in ok:
+        by_type.setdefault(r.get("question_type", "unknown"), []).append(r)
+    if len(by_type) > 1:
+        out["per_question_type"] = {
+            t: {"n": len(rs), "em": _mean(r["em"] for r in rs), "f1": _mean(r["f1"] for r in rs)}
+            for t, rs in sorted(by_type.items())
+        }
+    return out
 
-    def _extract_titles(self, docs: List[str]) -> List[str]:
-        """Extract titles from document strings formatted as 'Title: <title>\n<text>'"""
-        titles = []
-        for d in docs:
-            if d.startswith("Title:"):
-                titles.append(d.split("\n")[0].replace("Title:", "").strip())
-        return titles
 
-    def _save_results(self, results: List[Dict[str, Any]], metrics: Dict[str, Any], tag: str):
-        """Save raw results and aggregate metrics to JSON."""
-        path = os.path.join(RESULTS_DIR, f"{tag}_results.json")
-        with open(path, "w") as f:
-            json.dump({"metrics": metrics, "samples": results}, f, indent=2)
-        logger.info(f"Results saved to {path}")
+def compare_systems(records: Dict[str, List[Dict[str, Any]]], reference: str) -> Dict[str, Any]:
+    """Paired tests of every system against the reference on the questions both answered."""
+    ref = {r["id"]: r for r in records.get(reference, []) if not r.get("error")}
+    out = {}
+    for name, recs in records.items():
+        if name == reference:
+            continue
+        mine = {r["id"]: r for r in recs if not r.get("error")}
+        ids = sorted(set(ref) & set(mine))
+        if not ids:
+            continue
+        em_a = [mine[i]["em"] for i in ids]
+        em_b = [ref[i]["em"] for i in ids]
+        f1_test = paired_bootstrap_test([mine[i]["f1"] for i in ids], [ref[i]["f1"] for i in ids])
+        mc = mcnemar_test([e >= 1 for e in em_a], [e >= 1 for e in em_b])
+        out[name] = {
+            "n_paired": len(ids),
+            "delta_em": _mean(em_a) - _mean(em_b),
+            "delta_f1": f1_test["mean_diff"],
+            "em_mcnemar_p": mc["p_value"],
+            "f1_bootstrap_p": f1_test["p_value"],
+            "wins": mc["a_only"],
+            "losses": mc["b_only"],
+            "delta_llm_calls": _mean(mine[i]["cost"].get("n_llm_calls", 0) for i in ids)
+            - _mean(ref[i]["cost"].get("n_llm_calls", 0) for i in ids),
+        }
+    return out
+
+
+def summarize_detector(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ok = [r for r in records if not r.get("error")]
+    if not ok:
+        return {"n_samples": 0, "n_errors": len(records)}
+    y_true = [r["label_hallucinated"] for r in ok]
+    y_pred = [r["flagged"] for r in ok]
+    out = {"n_samples": len(ok), "n_errors": len(records) - len(ok),
+           "positive_rate": _mean(y_true), "flag_rate": _mean(y_pred)}
+    out.update(binary_classification_metrics(y_true, y_pred))
+    out["auroc"] = roc_auc(y_true, [r["score"] for r in ok])
+    out["avg_llm_calls"] = _mean(r["llm_calls"] for r in ok)
+    out["avg_latency_s"] = _mean(r["latency_s"] for r in ok)
+    tiers = [r["tier"] for r in ok]
+    out["tier_distribution"] = {f"tier_{t}": tiers.count(t) / len(tiers) for t in range(4)}
+    return out
+
+
+# ── Evaluator ────────────────────────────────────────────────────────────────
+class Evaluator:
+    def __init__(self, results_dir: Optional[str] = None) -> None:
+        self.results_dir = results_dir or config.RESULTS_DIR
+        os.makedirs(self.results_dir, exist_ok=True)
+
+    def _run_dir(self, tag: str) -> str:
+        path = os.path.join(self.results_dir, tag)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def evaluate_qa(
+        self,
+        systems: Dict[str, Any],
+        samples: Sequence[Dict[str, Any]],
+        tag: str,
+        long_answers: bool = False,
+        resume: bool = True,
+        reference: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+        summary_name: str = "summary",
+    ) -> Dict[str, Any]:
+        """Run every system on every sample; returns (and saves) the summary."""
+        run_dir = self._run_dir(tag)
+        records: Dict[str, List[Dict[str, Any]]] = {}
+        for name, system in systems.items():
+            path = os.path.join(run_dir, f"{name}.jsonl")
+            if not resume and os.path.exists(path):
+                os.remove(path)
+            done = {r["id"]: r for r in _read_jsonl(path) if not r.get("error")}
+            # Drop failed rows so they are retried on resume.
+            if resume and os.path.exists(path):
+                with open(path, "w", encoding="utf-8") as fh:
+                    for r in done.values():
+                        fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            todo = [s for s in samples if s.get("id", "") not in done]
+            if done:
+                logger.info("[%s] resuming: %d done, %d to go", name, len(done), len(todo))
+            for sample in tqdm(todo, desc=name):
+                start = time.perf_counter()
+                try:
+                    out = system.run(sample["question"], sample_documents(sample),
+                                     question_type=sample.get("type") if sample.get("type") in
+                                     ("bridge", "comparison") else None)
+                    rec = score_qa_record(sample, out, name, long_answers, time.perf_counter() - start)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as err:  # keep going; failed rows are retried on resume
+                    logger.error("[%s] sample %s failed: %s", name, sample.get("id"), err)
+                    rec = {"id": sample.get("id", ""), "system": name, "error": f"{type(err).__name__}: {err}",
+                           "latency_s": time.perf_counter() - start}
+                _append_jsonl(path, rec)
+                done[rec["id"]] = rec
+            ids = {s.get("id", "") for s in samples}
+            records[name] = [r for r in done.values() if r["id"] in ids]
+
+        reference = reference or ("vanilla_rag" if "vanilla_rag" in systems else next(iter(systems)))
+        summary = {
+            "tag": tag,
+            "mode": "qa",
+            "long_answers": long_answers,
+            "reference": reference,
+            "meta": meta or {},
+            "systems": {name: summarize_qa(recs, long_answers) for name, recs in records.items()},
+            "comparisons": compare_systems(records, reference),
+        }
+        self._save_summary(run_dir, summary, summary_name)
+        return summary
+
+    def evaluate_detector(
+        self,
+        monitors: Dict[str, Any],
+        samples: Sequence[Dict[str, Any]],
+        tag: str,
+        resume: bool = True,
+        meta: Optional[Dict[str, Any]] = None,
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """Score RAGBench responses with each monitor configuration against the gold labels."""
+        run_dir = self._run_dir(tag)
+        results = {}
+        for mode, monitor in monitors.items():
+            path = os.path.join(run_dir, f"detector_{mode}.jsonl")
+            if not resume and os.path.exists(path):
+                os.remove(path)
+            done = {r["id"]: r for r in _read_jsonl(path) if not r.get("error")}
+            for sample in tqdm([s for s in samples if s["id"] not in done], desc=f"detector/{mode}"):
+                tracker = CostTracker()
+                token = CURRENT_TRACKER.set(tracker)
+                start = time.perf_counter()
+                try:
+                    report = monitor.evaluate(sample["question"], sample["gold_response"], sample["documents"])
+                    rec = {
+                        "id": sample["id"], "mode": mode,
+                        "label_hallucinated": not sample["adherence_score"],
+                        "flagged": report.has_failure,
+                        "score": 1.0 - float(report.confidence_score),  # higher = more likely hallucinated
+                        "tier": report.monitor_tier_used,
+                        "failure_type": report.failure_type,
+                        "nli_entailment": report.nli_entailment,
+                        "judge_verdict": report.judge_verdict,
+                        "llm_calls": tracker.current.n_llm_calls,
+                        "latency_s": time.perf_counter() - start,
+                        "error": None,
+                    }
+                except KeyboardInterrupt:
+                    raise
+                except Exception as err:
+                    logger.error("[detector/%s] sample %s failed: %s", mode, sample.get("id"), err)
+                    rec = {"id": sample["id"], "mode": mode, "error": f"{type(err).__name__}: {err}"}
+                finally:
+                    CURRENT_TRACKER.reset(token)
+                _append_jsonl(path, rec)
+                done[rec["id"]] = rec
+            ids = {s["id"] for s in samples}
+            results[mode] = summarize_detector([r for r in done.values() if r["id"] in ids])
+        summary = {"tag": tag, "mode": "detector", "meta": meta or {}, "monitors": results}
+        self._save_summary(run_dir, summary)
+        return summary
+
+    def _save_summary(self, run_dir: str, summary: Dict[str, Any], name: str = "summary") -> None:
+        with open(os.path.join(run_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2)
+        try:
+            from analysis.report import render_markdown
+
+            report = "report.md" if name == "summary" else f"report_{name}.md"
+            with open(os.path.join(run_dir, report), "w", encoding="utf-8") as fh:
+                fh.write(render_markdown(summary))
+        except Exception as err:  # reporting must never lose results
+            logger.warning("Could not render report.md: %s", err)
+        logger.info("Saved results to %s", run_dir)

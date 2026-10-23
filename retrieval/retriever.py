@@ -1,152 +1,177 @@
 """
-retrieval/retriever.py
-Hybrid retriever: BM25 (sparse) + FAISS (dense), score-fused.
+retrieval/retriever.py — Hybrid sparse + dense retrieval.
+
+BM25 (lexical) and a sentence-embedding index (semantic) are fused either by
+a weighted sum of min-max-normalised scores ("linear") or by Reciprocal Rank
+Fusion ("rrf"). BM25 catches exact entity names; dense retrieval catches
+paraphrases — multi-hop questions need both.
+
+``HybridRetriever.build_index(docs)`` returns an immutable ``HybridIndex``.
+Nothing is stored on the retriever itself, so one retriever can safely serve
+concurrent API requests.
 """
+from __future__ import annotations
 
-import string
 import logging
-import numpy as np
+import re
+import string
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
-from rank_bm25 import BM25Okapi
-from retrieval.vector_store import VectorStore
-from config import TOP_K_RETRIEVAL, BM25_WEIGHT, DENSE_WEIGHT
+from typing import Any, List, Optional, Sequence
 
-try:
-    from config import RETRIEVAL_FUSION_METHOD
-except ImportError:
-    RETRIEVAL_FUSION_METHOD = "linear"
+import numpy as np
+from rank_bm25 import BM25Okapi
+
+import config
+from retrieval.vector_store import DenseIndex, VectorStore
 
 logger = logging.getLogger(__name__)
 
 STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "if", "because", "as", "what",
     "when", "where", "how", "who", "whom", "this", "that", "these", "those",
-    "am", "is", "are", "was", "were", "be", "been", "being",
+    "am", "is", "are", "was", "were", "be", "been", "being", "which",
     "have", "has", "had", "do", "does", "did", "to", "of", "in", "for",
     "on", "with", "about", "against", "between", "into", "through", "during",
-    "before", "after", "above", "below", "to", "from", "up", "down", "in", "out",
-    "on", "off", "over", "under", "again", "further", "then", "once", "here",
+    "before", "after", "above", "below", "from", "up", "down", "out",
+    "off", "over", "under", "again", "further", "then", "once", "here",
     "there", "all", "any", "both", "each", "few", "more", "most", "other",
     "some", "such", "no", "nor", "not", "only", "own", "same", "so", "than",
-    "too", "very", "s", "t", "can", "will", "just", "don", "should", "now"
+    "too", "very", "s", "t", "can", "will", "just", "don", "should", "now",
 }
+_PUNCT = str.maketrans("", "", string.punctuation)
+_TITLE_RE = re.compile(r"^Title:\s*(.+?)(?:\n|$)")
 
-def _tokenize(text: str) -> List[str]:
-    """
-    Tokenizes text by lowercasing, removing punctuation, and filtering out stopwords.
-    
-    Args:
-        text: The input string.
-        
-    Returns:
-        List of cleaned tokens.
-    """
-    text = text.lower()
-    text = text.translate(str.maketrans("", "", string.punctuation))
-    tokens = text.split()
-    return [t for t in tokens if t not in STOPWORDS]
+
+def tokenize(text: str) -> List[str]:
+    """Lowercase, strip punctuation, drop stopwords."""
+    return [t for t in text.lower().translate(_PUNCT).split() if t not in STOPWORDS]
+
+
+# Backwards-compatible alias
+_tokenize = tokenize
+
+
+def extract_title(doc: str) -> str:
+    m = _TITLE_RE.match(doc)
+    return m.group(1).strip() if m else ""
+
 
 @dataclass
 class RetrievalResult:
-    """Dataclass representing a retrieved document and its scores."""
+    """A retrieved passage with its component scores."""
+
     text: str
     hybrid_score: float
     dense_score: float
     bm25_score: float
     idx: int
 
-class HybridRetriever:
-    """
-    Combines BM25 and dense retrieval via linear score fusion or RRF.
-    """
+    @property
+    def title(self) -> str:
+        return extract_title(self.text)
 
-    def __init__(self) -> None:
-        """Initializes the HybridRetriever with an empty vector store."""
-        self.vector_store = VectorStore()
-        self.bm25: Optional[BM25Okapi] = None
-        self.documents: List[str] = []
-        logger.info("Initialized HybridRetriever")
+    # Dict-style access keeps older code (r["text"]) working.
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
 
-    def index_documents(self, documents: List[str]) -> None:
+
+def _minmax(x: np.ndarray) -> np.ndarray:
+    lo, hi = float(x.min()), float(x.max())
+    return (x - lo) / (hi - lo) if hi - lo > 1e-12 else np.zeros_like(x)
+
+
+class HybridIndex:
+    """Immutable BM25 + dense index over one document set."""
+
+    def __init__(self, documents: Sequence[str], dense: DenseIndex, store: VectorStore) -> None:
+        self.documents = list(documents)
+        self._dense = dense
+        self._store = store
+        tokenized = [tokenize(d) or ["_"] for d in self.documents]
+        self._bm25 = BM25Okapi(tokenized) if self.documents else None
+
+    def __len__(self) -> int:
+        return len(self.documents)
+
+    def search(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        method: Optional[str] = None,
+        exclude: Optional[Sequence[str]] = None,
+    ) -> List[RetrievalResult]:
         """
-        Builds BM25 + FAISS index over the given documents.
-        
         Args:
-            documents: List of text documents to index.
-        """
-        logger.info(f"Indexing {len(documents)} documents...")
-        self.documents = documents
-        tokenized = [_tokenize(d) for d in documents]
-        self.bm25 = BM25Okapi(tokenized)
-        self.vector_store.build_index(documents)
-        logger.info("Finished indexing documents.")
-
-    def retrieve(self, query: str, top_k: int = TOP_K_RETRIEVAL) -> List[RetrievalResult]:
-        """
-        Retrieves top-k documents via hybrid scoring.
-        
-        Args:
-            query: The search query.
-            top_k: Number of documents to retrieve.
-            
-        Returns:
-            List of RetrievalResult objects.
+            query: search text.
+            top_k: number of results (defaults to config.TOP_K_RETRIEVAL).
+            method: "linear" | "rrf" | "bm25" | "dense" (defaults to config).
+            exclude: passages to skip (e.g. ones already in the context).
         """
         n = len(self.documents)
         if n == 0:
-            logger.warning("No documents indexed. Returning empty results.")
             return []
+        top_k = top_k or config.TOP_K_RETRIEVAL
+        method = (method or config.RETRIEVAL_FUSION_METHOD).lower()
 
-        # -- BM25 scores --
-        bm25_scores = np.array(self.bm25.get_scores(_tokenize(query)), dtype=float)
-        bm25_min = bm25_scores.min()
-        bm25_max = bm25_scores.max()
-        if bm25_max - bm25_min > 0:
-            bm25_norm = (bm25_scores - bm25_min) / (bm25_max - bm25_min + 1e-9)
+        bm25_raw = np.asarray(self._bm25.get_scores(tokenize(query)), dtype=float)
+        bm25 = _minmax(bm25_raw)
+
+        dense_raw = np.zeros(n, dtype=float)
+        if method != "bm25":
+            for hit in self._dense.search(self._store.embed_query(query), top_k=n):
+                dense_raw[hit["idx"]] = hit["score"]
+        dense = _minmax(dense_raw)
+
+        if method == "bm25":
+            fused = bm25_raw
+        elif method == "dense":
+            fused = dense_raw
+        elif method == "rrf":
+            fused = np.zeros(n, dtype=float)
+            for scores in (bm25_raw, dense_raw):
+                for rank, idx in enumerate(np.argsort(-scores, kind="stable")):
+                    fused[idx] += 1.0 / (config.RRF_K + rank + 1)
         else:
-            bm25_norm = np.zeros_like(bm25_scores)
+            fused = config.BM25_WEIGHT * bm25 + config.DENSE_WEIGHT * dense
 
-        # -- Dense scores --
-        dense_results = self.vector_store.search(query, top_k=n)
-        dense_scores = np.zeros(n, dtype=float)
-        for r in dense_results:
-            dense_scores[r["idx"]] = r["score"]
-
-        dense_min = dense_scores.min()
-        dense_max = dense_scores.max()
-        if dense_max - dense_min > 0:
-            dense_norm = (dense_scores - dense_min) / (dense_max - dense_min + 1e-9)
-        else:
-            dense_norm = np.zeros_like(dense_scores)
-
-        # -- Hybrid fusion --
-        if RETRIEVAL_FUSION_METHOD == "rrf":
-            # Reciprocal Rank Fusion
-            hybrid_scores = np.zeros(n, dtype=float)
-            bm25_ranks = np.argsort(-bm25_scores)
-            dense_ranks = np.argsort(-dense_scores)
-            
-            k = 60
-            for rank, doc_idx in enumerate(bm25_ranks):
-                hybrid_scores[doc_idx] += 1.0 / (k + rank + 1)
-            for rank, doc_idx in enumerate(dense_ranks):
-                hybrid_scores[doc_idx] += 1.0 / (k + rank + 1)
-        else:
-            # Linear combination
-            hybrid_scores = BM25_WEIGHT * bm25_norm + DENSE_WEIGHT * dense_norm
-
-        # -- Sort & return top-k --
-        ranked = np.argsort(-hybrid_scores)[:top_k]
-        results = []
-        for idx in ranked:
+        skip = set(exclude or [])
+        results: List[RetrievalResult] = []
+        for idx in np.argsort(-fused, kind="stable"):
+            text = self.documents[idx]
+            if text in skip:
+                continue
             results.append(RetrievalResult(
-                text=self.documents[idx],
-                hybrid_score=float(hybrid_scores[idx]),
-                dense_score=float(dense_scores[idx]),
-                bm25_score=float(bm25_norm[idx]),
+                text=text,
+                hybrid_score=float(fused[idx]),
+                dense_score=float(dense_raw[idx]),
+                bm25_score=float(bm25[idx]),
                 idx=int(idx),
             ))
-            
-        logger.debug(f"Retrieved {len(results)} results for query: '{query}'")
+            if len(results) >= top_k:
+                break
         return results
+
+    def search_texts(self, query: str, top_k: Optional[int] = None, **kwargs: Any) -> List[str]:
+        return [r.text for r in self.search(query, top_k=top_k, **kwargs)]
+
+
+class HybridRetriever:
+    """Factory for HybridIndex objects; holds the (shared) embedding model."""
+
+    def __init__(self, vector_store: Optional[VectorStore] = None, encoder: Any = None) -> None:
+        self.vector_store = vector_store or VectorStore(encoder=encoder)
+        self._last: Optional[HybridIndex] = None  # legacy stateful API only
+
+    def build_index(self, documents: Sequence[str]) -> HybridIndex:
+        docs = [d for d in documents if d and d.strip()]
+        return HybridIndex(docs, self.vector_store.create_index(docs), self.vector_store)
+
+    # Legacy stateful API (not thread-safe) — kept so older scripts still work.
+    def index_documents(self, documents: Sequence[str]) -> None:
+        self._last = self.build_index(documents)
+
+    def retrieve(self, query: str, top_k: Optional[int] = None) -> List[RetrievalResult]:
+        if self._last is None:
+            logger.warning("No documents indexed. Returning empty results.")
+            return []
+        return self._last.search(query, top_k=top_k)

@@ -1,0 +1,15 @@
+# docker compose up --build   ->  API on :8000 (Swagger at /docs), UI on :7860
+services:
+  api:
+    build: .
+    env_file: .env
+    ports: ["8000:8000"]
+    volumes: ["hf-cache:/models"]
+  ui:
+    build: .
+    env_file: .env
+    command: ["python", "ui.py"]
+    ports: ["7860:7860"]
+    volumes: ["hf-cache:/models"]
+volumes:
+  hf-cache:

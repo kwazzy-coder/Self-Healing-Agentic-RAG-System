@@ -1,0 +1,5 @@
+name: llm_judge_only
+description: LLM judge on every answer (no cheap tiers) - cost of not cascading.
+seeds: [42]
+dataset: {name: hotpotqa, n_samples: 100}
+healing: {monitor_mode: llm}

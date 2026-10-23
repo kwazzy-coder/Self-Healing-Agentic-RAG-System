@@ -1,75 +1,57 @@
 """
-data/ragbench_loader.py
-Loads the galileo-ai/ragbench dataset from HuggingFace.
+data/ragbench_loader.py — RAGBench (Friel et al., 2024; galileo-ai/ragbench).
 
-RAGBench fields used:
-  - question              : the question
-  - documents             : list of 4 passage strings
-  - response              : LLM-generated answer (ground truth baseline)
-  - adherence_score       : bool — is response fully grounded?
-  - faithfulness scores   : ragas_faithfulness, trulens_groundedness, gpt3_adherence
-  - relevance_score       : how relevant retrieved docs are
-  - sentence_support_info : per-sentence support labels (for fine-grained eval)
-  - unsupported_keys      : which response sentences are NOT supported
+Each row has a question, the retrieved documents, a *response* written by an
+LLM, and human/GPT-4 annotations of whether that response is grounded
+(`adherence_score`) plus which sentences are unsupported. That makes it a
+labelled benchmark for hallucination *detectors* — exactly what the
+self-monitor is.
 
-Available subsets (12 total):
-  covidqa, cuad, delucionqa, emanual, expertqa, finqa,
-  hagrid, hotpotqa, msmarco, pubmedqa, tatqa, techqa
+Subsets: covidqa, cuad, delucionqa, emanual, expertqa, finqa, hagrid,
+hotpotqa, msmarco, pubmedqa, tatqa, techqa
 """
+from __future__ import annotations
 
-from datasets import load_dataset
-import random
-from config import RANDOM_SEED
+import logging
+from typing import Any, Dict, List, Optional
+
+import config
+from data._hf import load_first_available, seeded_sample
+
+logger = logging.getLogger(__name__)
 
 
-def load_ragbench(subset: str = "hotpotqa", split: str = "test", n_samples: int = None):
-    """
-    Load a RAGBench subset.
-
-    Args:
-        subset   : one of the 12 available subsets
-        split    : 'train', 'validation', or 'test'
-        n_samples: if None, return full split
-
-    Returns:
-        List of dicts with standardised keys.
-    """
-    print(f"[RAGBench] Loading subset='{subset}', split='{split}'...")
-    ds = load_dataset("galileo-ai/ragbench", subset, split=split, trust_remote_code=True)
-
+def load_ragbench(
+    subset: str = "hotpotqa",
+    split: str = "test",
+    n_samples: Optional[int] = None,
+    seed: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    logger.info("Loading RAGBench subset=%s split=%s...", subset, split)
+    ds = load_first_available(("galileo-ai/ragbench", "rungalileo/ragbench"), subset, split=split)
     samples = []
     for row in ds:
+        if row.get("adherence_score") is None:
+            continue  # unlabeled rows are useless for detector evaluation
         samples.append({
-            "id": row.get("id", ""),
+            "id": str(row.get("id", "")),
             "question": row["question"],
-            "documents": row["documents"],           # 4 passage strings
-            "gold_response": row["response"],        # GPT-3.5 baseline answer
-            "adherence_score": row["adherence_score"],   # True/False
-            "faithfulness": row.get("ragas_faithfulness", None),
-            "groundedness": row.get("trulens_groundedness", None),
-            "gpt3_adherence": row.get("gpt3_adherence", None),
-            "relevance_score": row.get("relevance_score", None),
-            "utilization_score": row.get("utilization_score", None),
-            "completeness_score": row.get("completeness_score", None),
-            # Sentence-level support: which response sentences are unsupported
+            "documents": list(row["documents"]),
+            "gold_response": row["response"],
+            "adherence_score": bool(row["adherence_score"]),
+            "faithfulness": row.get("ragas_faithfulness"),
+            "groundedness": row.get("trulens_groundedness"),
+            "relevance_score": row.get("relevance_score"),
+            "utilization_score": row.get("utilization_score"),
+            "completeness_score": row.get("completeness_score"),
             "unsupported_sentence_keys": row.get("unsupported_response_sentence_keys", []),
-            "sentence_support_info": row.get("sentence_support_information", []),
         })
-
-    if n_samples is not None and n_samples < len(samples):
-        random.seed(RANDOM_SEED)
-        samples = random.sample(samples, n_samples)
-
-    print(f"[RAGBench] Loaded {len(samples)} samples from '{subset}'.")
+    samples = seeded_sample(samples, n_samples, config.RANDOM_SEED if seed is None else seed)
+    logger.info("Loaded %d RAGBench/%s samples (%d hallucinated).", len(samples), subset,
+                sum(not s["adherence_score"] for s in samples))
     return samples
 
 
-def get_ragbench_hallucinated_samples(subset: str = "covidqa", split: str = "test"):
-    """
-    Return only samples where adherence_score=False (the LLM hallucinated).
-    Useful for testing the self-monitoring module specifically.
-    """
-    all_samples = load_ragbench(subset=subset, split=split)
-    hallucinated = [s for s in all_samples if not s["adherence_score"]]
-    print(f"[RAGBench] {len(hallucinated)}/{len(all_samples)} samples are hallucinated in '{subset}'.")
-    return hallucinated
+def get_ragbench_hallucinated_samples(subset: str = "covidqa", split: str = "test") -> List[Dict[str, Any]]:
+    """Only the rows whose response is NOT fully grounded."""
+    return [s for s in load_ragbench(subset=subset, split=split) if not s["adherence_score"]]

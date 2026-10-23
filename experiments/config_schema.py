@@ -1,59 +1,91 @@
 """
-experiments/config_schema.py — Experiment Configuration Schema
+experiments/config_schema.py — Validated YAML schema for experiments.
 
-Pydantic models for defining reproducible experiment configurations.
-Each experiment is defined by a YAML file that specifies all parameters.
+Every field left empty (null) falls back to config.py, so each YAML file only
+states what that experiment changes.
 """
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
 import yaml
 from pydantic import BaseModel, Field
-from typing import List, Optional
+
 
 class RetrievalConfig(BaseModel):
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    top_k: int = 7
-    bm25_weight: float = 0.3
-    dense_weight: float = 0.7
-    fusion_method: str = "linear"  # "linear" or "rrf"
     enabled: bool = True
+    embedding_model: Optional[str] = None
+    top_k: Optional[int] = None
+    bm25_weight: Optional[float] = None
+    dense_weight: Optional[float] = None
+    fusion_method: Optional[str] = None  # linear | rrf | bm25 | dense
+
 
 class HealingConfig(BaseModel):
     enabled: bool = True
-    max_correction_attempts: int = 2
-    confidence_threshold: float = 0.6
+    max_correction_attempts: Optional[int] = None
+    monitor_mode: str = "tiered"  # tiered | heuristic | nli | heuristic_nli | heuristic_llm | llm
     use_nli_grounding: bool = True
-    nli_model: str = "cross-encoder/nli-deberta-v3-small"
+    use_llm_judge: bool = True
+    nli_low: Optional[float] = None
+    nli_high: Optional[float] = None
     decompose_questions: bool = True
+    always_correct: bool = False
+
 
 class LLMConfig(BaseModel):
-    backend: str = "gemini"
-    model_name: Optional[str] = None  # auto-detected from backend
+    backend: Optional[str] = None
+    model_name: Optional[str] = None
     temperature: float = 0.0
-    max_answer_words: int = 8
-    context_char_limit: int = 3000
+    reasoning_effort: Optional[str] = None
+
 
 class DatasetConfig(BaseModel):
-    name: str = "hotpotqa"  # hotpotqa, ragbench, nq, triviaqa
-    split: str = "validation"
+    name: str = "hotpotqa"  # hotpotqa | musique
     n_samples: int = 100
-    subset: Optional[str] = None  # for ragbench: covidqa, msmarco, etc.
+    subset: Optional[str] = None
+    question_type: Optional[str] = None
+
 
 class ExperimentConfig(BaseModel):
     name: str
     description: str = ""
-    seeds: List[int] = [42, 123, 456]
+    seeds: List[int] = Field(default_factory=lambda: [42])
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     healing: HealingConfig = Field(default_factory=HealingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
-    metrics: List[str] = ["em", "f1", "rouge_l", "faithfulness"]
     compare_baseline: bool = True
-    
+
     @classmethod
-    def from_yaml(cls, path: str) -> "ExperimentConfig":
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        return cls(**data)
-    
+    def from_yaml(cls, path: str) -> ExperimentConfig:
+        with open(path, encoding="utf-8") as fh:
+            return cls(**(yaml.safe_load(fh) or {}))
+
     def to_yaml(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(self.model_dump(), f, default_flow_style=False)
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(self.model_dump(), fh, sort_keys=False)
+
+    def config_overrides(self) -> Dict[str, Any]:
+        """Global config.py values this experiment changes."""
+        o: Dict[str, Any] = {}
+        r, h, llm = self.retrieval, self.healing, self.llm
+        if r.embedding_model:
+            o["EMBEDDING_MODEL"] = r.embedding_model
+        if r.bm25_weight is not None:
+            o["BM25_WEIGHT"] = r.bm25_weight
+        if r.dense_weight is not None:
+            o["DENSE_WEIGHT"] = r.dense_weight
+        if h.nli_low is not None:
+            o["NLI_LOW"] = h.nli_low
+        if h.nli_high is not None:
+            o["NLI_HIGH"] = h.nli_high
+        o["ENABLE_NLI"] = h.use_nli_grounding
+        o["ENABLE_LLM_JUDGE"] = h.use_llm_judge
+        o["ENABLE_DECOMPOSITION"] = h.decompose_questions
+        o["TEMPERATURE"] = llm.temperature
+        if llm.reasoning_effort is not None:
+            o["LLM_REASONING_EFFORT"] = llm.reasoning_effort or None
+        if llm.model_name:
+            o["LLM_MODEL"] = llm.model_name
+        return o
